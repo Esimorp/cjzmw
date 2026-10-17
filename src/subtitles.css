@@ -1,0 +1,59 @@
+/* Subtitle styling for the Remotion player only.
+   Loaded once from App.tsx, so the SSR shell, the hydrated client and the
+   Player composition all resolve the same rules in the same order.
+   The editor's left column deliberately uses its own fixed `.token-chip`
+   look in App.css and never applies these classes.
+   Theme variables (--ink, --calm-accent) come from index.css. */
+
+/* Registered `default` token style. Player-only: normal and focused variants. */
+.token-chip--default {
+  font-size: 35px;
+  color: white;
+  margin-inline: 0;
+}
+
+.token-chip--default-focused {
+  font-size: 48px;
+  color: #7856FF;
+}
+
+/* Player captions. These are their own base classes — deliberately not the
+   editor's `.token-chip` paper look (no border, background or chip padding).
+   Colour, font size and side margins come from the registered style classes;
+   only a text shadow is added here for legibility over video, and it never
+   overrides the registered properties. */
+.player-caption-layer {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6% 7%;
+  pointer-events: none;
+}
+
+.player-caption-segment {
+  max-width: 88%;
+  text-align: center;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.9),
+    0 0 10px rgba(0, 0, 0, 0.7);
+}
+
+.player-caption-gap {
+  display: inline-block;
+  width: 0.35em;
+}
+
+.player-caption-segment>span {
+  display: inline;
+}
+
+/* Real line break inside a player caption segment. */
+.player-caption-segment>br {
+  display: block;
+  line-height: 0;
+}

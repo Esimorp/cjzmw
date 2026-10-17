@@ -12,6 +12,22 @@ dist
 dist-ssr
 *.local
 
+# Bundled Qwen ASR runtime (binaries, models, Python env) — never committed.
+lib/qwen/
+
+# Generated verification fixtures and logs (validation artifacts, never committed).
+.validation/
+
+# Project-local Python environment for the ASR worker (never committed).
+.venv/
+.python/
+.cache/
+__pycache__/
+*.pyc
+
+# Persistent workspace (saved video + subtitle JSON); configurable via WORKSPACE_DIR.
+storage/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

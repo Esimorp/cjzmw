@@ -1,0 +1,11 @@
+# Qwen3-ASR worker dependencies (CPU only, no PyTorch).
+# Resolved and verified on Windows x64 / Python 3.14.4 (cp314 win_amd64 wheels,
+# `srt` builds from sdist). See SETUP.md for the exact provisioning steps.
+numpy==2.5.4
+scipy==1.18.1
+onnxruntime==1.31.0
+gguf==0.19.0
+pydub==0.25.1
+srt==3.5.3
+# pydub imports the stdlib `audioop`, removed in Python 3.13+. Required on 3.13+.
+audioop-lts==0.2.2; python_version >= "3.13"
