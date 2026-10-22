@@ -50,7 +50,7 @@
 
 | 项目 | 要求 | 缺失后果 |
 | --- | --- | --- |
-| 操作系统 | Windows 10/11 x64 或 Windows Server x64（识别运行时依赖 Windows `.dll`） | 语音识别/强制对齐不可用 |
+| 操作系统 | Windows 10/11 x64 或 Windows Server x64（`inference/bin` 放的是 Windows x64 版 llama.cpp 二进制） | 语音识别/强制对齐不可用 |
 | Node.js | ≥ 24（本项目在 v24.15 上验证；`pnpm start` 直接执行 `server.ts`） | 无法启动 |
 | pnpm | ≥ 9（lockfile v9，本项目在 11.1 上验证） | 无法安装依赖 |
 | ffmpeg / ffprobe | 在 `PATH` 中，或用环境变量指定绝对路径 | 上传与识别失败 |
@@ -165,11 +165,12 @@ lib/qwen/
 | --- | --- | --- |
 | 模型权重（上方 6 个文件） | 上游 [models release](https://github.com/HaujetZhao/Qwen3-ASR-GGUF/releases/tag/models) 的模型压缩包 | 解压到 `lib/qwen/model/` |
 | Python 源码包 `qwen_asr_gguf/` | 上游仓库根目录的同名目录 | `lib/qwen/qwen_asr_gguf/` |
-| llama.cpp 预编译 DLL | [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) 中的 `llama-bXXXX-bin-win-vulkan-x64.zip` | `lib/qwen/qwen_asr_gguf/inference/bin/` |
+| llama.cpp 预编译二进制 | **上游仓库不提供**，需自行从 [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) 下载 `llama-bXXXX-bin-win-vulkan-x64.zip` | 解压后把 DLL 放到 `lib/qwen/qwen_asr_gguf/inference/bin/` |
 
 放置说明：
 
-- 本项目只使用 `model/` 与 `qwen_asr_gguf/`；上游的 `transcribe.exe`、`internal/`、`export/`、`readme.md` 可以不复制，也不参与运行。
+- 上游只提供 Python 推理源码（`qwen_asr_gguf/`）与单独发布的模型包（models release），**不附带 llama.cpp 二进制**；`inference/bin/` 需要按上表手动放入。
+- 本项目只使用 `model/` 与 `qwen_asr_gguf/`；`transcribe.exe`、`internal/` 是冻结版运行时的产物（不在上游仓库源码中），`export/`、`readme.md` 是转换/说明材料，均不参与运行，可以不复制。
 - DLL 必须放在 `qwen_asr_gguf/inference/bin/`：`python/qwen_worker.py` 启动时会把该目录加入 `PATH` 和 Windows DLL 搜索目录（上游文档写作 `qwen_asr_gguf/bin/`，与本项目的目录结构不同）。
 - ASR 可选 0.6B 或 1.7B 权重，保持上方列出的默认文件名即可，worker 按 `qwen_asr_gguf/inference/schema.py` 中的默认文件名加载。
 - 运行时目录可以用 `QWEN_ASR_DIR` 指向别处，结构保持不变。

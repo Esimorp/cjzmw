@@ -17,8 +17,11 @@ used and are never copied into the venv.
 - Windows x64.
 - `ffmpeg` on `PATH` (or `FFMPEG_PATH`) — used by Node to extract 16 kHz mono WAV.
 - `lib/qwen/` copied in manually (git-ignored): `qwen_asr_gguf/` (source
-  package), `model/` (weights from the upstream models release), and the
-  llama.cpp DLLs in `qwen_asr_gguf/inference/bin/`.
+  package) and `model/` (weights from the upstream models release). The
+  upstream repository ships **no** llama.cpp binaries: download the prebuilt
+  Windows package from
+  [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) and put
+  the DLLs in `qwen_asr_gguf/inference/bin/`.
 
 ## Provision the venv
 
