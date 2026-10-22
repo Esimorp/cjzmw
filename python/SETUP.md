@@ -1,9 +1,11 @@
 # Qwen3-ASR worker environment
 
 The transcription backend runs the **unmodified** `lib/qwen/qwen_asr_gguf`
-source package inside a project-local virtualenv. The frozen
-`lib/qwen/transcribe.exe` and `lib/qwen/internal/` modules are **not** used and
-are never copied into the venv.
+source package inside a project-local virtualenv. The package and its models
+come from [HaujetZhao/Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF);
+see the README's “lib 放置结构” section for the exact directory layout. The
+frozen `lib/qwen/transcribe.exe` and `lib/qwen/internal/` modules are **not**
+used and are never copied into the venv.
 
 - Interpreter: `.venv/Scripts/python.exe`
 - Worker (tracked): `python/qwen_worker.py`
@@ -14,8 +16,9 @@ are never copied into the venv.
 
 - Windows x64.
 - `ffmpeg` on `PATH` (or `FFMPEG_PATH`) — used by Node to extract 16 kHz mono WAV.
-- `lib/qwen/` copied in manually (git-ignored): `qwen_asr_gguf/`, `model/`,
-  `qwen_asr_gguf/inference/bin/*.dll`.
+- `lib/qwen/` copied in manually (git-ignored): `qwen_asr_gguf/` (source
+  package), `model/` (weights from the upstream models release), and the
+  llama.cpp DLLs in `qwen_asr_gguf/inference/bin/`.
 
 ## Provision the venv
 

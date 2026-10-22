@@ -1,250 +1,539 @@
-# 超级字幕王 (cjzmw)
+# 超级字幕王（cjzmw）
 
-Express 5 + React 19 SSR skeleton built on Vite, with Remotion pinned for video rendering.
+本地运行的中文视频字幕工作台：**导入视频 → 语音识别 / 导入 TXT → 强制对齐 → 逐字校订 → 导出烧录字幕的 MP4**。
 
-## Stack
+视频、音频与字幕都留在自己的机器上：识别由本地 Qwen3-ASR 运行时完成，预览与导出由本地 Remotion + Chromium 渲染，运行时不访问任何云端服务。整个流程只处理**音频、文本和像素渲染**，不调用视觉/多模态模型，详见[模型使用说明](#模型使用说明不使用视觉模型)。
 
-- **Express 5** — HTTP server, Vite middleware in development
-- **React 19** — `renderToString` on the server, `hydrateRoot` on the client
-- **Vite 8** — dev middleware, `transformIndexHtml`, `ssrLoadModule`, client + SSR builds
-- **tsx** — runs and watches `server.ts` in development (dev dependency)
-- **Remotion 4.0.536** — pinned (`remotion`, `@remotion/player`, `@remotion/cli`, `@remotion/fonts`, plus `@remotion/bundler` + `@remotion/renderer` for MP4 export)
+## 目录
 
-## Scripts
+- [功能概览](#功能概览)
+- [技术栈](#技术栈)
+- [环境要求](#环境要求)
+- [快速开始](#快速开始)
+- [部署说明](#部署说明)
+- [使用说明](#使用说明)
+- [环境变量](#环境变量)
+- [常见问题](#常见问题)
+- [HTTP API](#http-api)
+- [开发与测试](#开发与测试)
+- [项目结构](#项目结构)
+- [实现要点](#实现要点)
+- [模型使用说明：不使用视觉模型](#模型使用说明不使用视觉模型)
 
-| Script | Description |
+## 功能概览
+
+| 功能 | 说明 |
 | --- | --- |
-| `pnpm dev` | Starts Express with Vite in middleware mode via `tsx watch server.ts` (restarts on server changes, HMR for the client). Default port `5173`. |
-| `pnpm build` | Type-checks all projects (`tsc -b`), builds the client to `dist/client`, then builds the SSR bundle to `dist/server`. |
-| `pnpm start` | Serves the production build (`node server.ts --production`). Default port `3000`. |
-| `pnpm lint` | Runs Oxlint. |
-| `pnpm typecheck` | Type-checks the server project (`tsc -p tsconfig.server.json --noEmit`). |
-| `pnpm test` | Runs the `node:test` timestamp-mapping tests (`node --test src/*.test.ts`, Node 24 native TypeScript). |
-| `pnpm preview` | Serves the production build (`node server.ts --production`), same as `pnpm start`. |
+| 视频导入 | 上传本地视频，`ffprobe` 读取时长、分辨率、帧率、编码，浏览器直接预览。单文件上限 **2 GB**，不做转码 |
+| 语音识别 | 本地 Qwen3-ASR（CPU，中文），输出段落与**逐字时间戳**；任务排队、可取消，单任务上限 30 分钟 |
+| 强制对齐 | 用已有字幕文本 + 同一段音频做强制对齐，得到逐字时间戳 |
+| TXT 导入 | UTF-8 文本，**一行 = 一段字幕**，导入后替换当前字幕，再由强制对齐补时间 |
+| 逐字校订 | 段落编辑、段落内换行、光标处插入段落、向前/向后合并、点击段落定位、点击词元查看起止时间、词元样式（默认样式 / 重点） |
+| 画面预览 | Remotion Player 帧级预览，与导出使用同一份 composition |
+| MP4 导出 | 服务端 Remotion 渲染，烧录字幕并保留原音轨，完成后浏览器自动下载；同一时间只跑一个导出 |
+| 工作区 | 自动保存与恢复：刷新页面或重启服务后可继续编辑 |
 
-## Environment variables
+## 技术栈
 
-- `PORT` — server port. Defaults to `5173` in development and `3000` in production.
-- `NODE_ENV` — set to `production` to serve built assets instead of using Vite middleware. The `--production` CLI flag does the same and takes precedence in the scripts.
-- `FFPROBE_PATH` — **optional**. Absolute path to the `ffprobe` binary used to inspect uploads. When unset, the server runs `ffprobe`, so **`ffprobe` must be installed and available on `PATH`**; if it is missing, uploads fail with `503 FFPROBE_UNAVAILABLE`.
-- `FFMPEG_PATH` — **optional**. Absolute path to the `ffmpeg` binary used to extract 16 kHz mono PCM audio for speech recognition. When unset, `ffmpeg` is resolved from `PATH`; if it is missing, jobs fail with `503 FFMPEG_UNAVAILABLE`.
-- `QWEN_ASR_DIR` — **optional**. Runtime directory containing the `model/` and `qwen_asr_gguf/` sources/deps. Defaults to `lib/qwen`. The whole directory is git-ignored and must be copied in manually. The frozen `transcribe.exe` inside it is **not** used.
-- `QWEN_PYTHON` — **optional**. Absolute path to the worker interpreter. Defaults to `.venv\Scripts\python.exe` in the repository; see [`python/SETUP.md`](python/SETUP.md).
-- `WORKSPACE_DIR` — **optional**. Directory for the persistent workspace (`workspace.json`). Defaults to `./storage/workspace` (git-ignored).
-- `PUBLIC_DIR` — **optional**. Static root that serves uploads and fonts. Defaults to `./public`; videos are stored in and served from `<PUBLIC_DIR>/videos` (git-ignored). Used by tests to isolate the static root instead of touching the real `public/`.
-- `EXPORT_DIR` — **optional**. Directory for rendered MP4s. Defaults to `./storage/exports` (git-ignored).
-- `REMOTION_LOG_LEVEL` — **optional**. Verbosity of Remotion's own renderer logs on the server console: `trace`, `verbose` (default), `info`, `warn` or `error`. Invalid values fall back to `verbose`.
+- **Express 5** — HTTP 服务；开发模式挂载 Vite 中间件
+- **React 19** — 服务端 `renderToString`，客户端 `hydrateRoot`
+- **Vite 8** — 开发中间件、`transformIndexHtml`、`ssrLoadModule`、客户端与 SSR 构建
+- **tsx** — 开发模式下运行并监听 `server.ts`
+- **Remotion 4.0.536** — 预览播放器与 MP4 服务端渲染
+- **TypeScript 6 / Node 24** — Node 原生执行 `.ts`（`node server.ts`）
+- **Oxlint** — 代码检查
+- **[Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF)** — 本地语音识别与强制对齐（Qwen3-ASR + Qwen3-ForcedAligner，ONNX Encoder + GGUF Decoder，CPU 推理）
 
-## Media API
+## 环境要求
 
-The media router (`media-server.ts`) is mounted at `/api` **before** Vite middleware, static assets, and SSR, so uploads and video content never fall through to the client. Unknown `/api` routes return a JSON `404`.
+### 运行必需
 
-| Route | Description |
-| --- | --- |
-| `POST /api/videos` | Accepts one file in the `video` multipart field (max **2 GB**, one file per request), probes it with `ffprobe`, then copies it to `public/videos/<id>.<ext>` and returns the video metadata as JSON (`201`). |
-| `DELETE /api/videos/:id` | Deletes the stored file and metadata, returning `204`. |
+| 项目 | 要求 | 缺失后果 |
+| --- | --- | --- |
+| 操作系统 | Windows 10/11 x64 或 Windows Server x64（识别运行时依赖 Windows `.dll`） | 语音识别/强制对齐不可用 |
+| Node.js | ≥ 24（本项目在 v24.15 上验证；`pnpm start` 直接执行 `server.ts`） | 无法启动 |
+| pnpm | ≥ 9（lockfile v9，本项目在 11.1 上验证） | 无法安装依赖 |
+| ffmpeg / ffprobe | 在 `PATH` 中，或用环境变量指定绝对路径 | 上传与识别失败 |
+| 磁盘 | `lib/qwen` ≈ 1.5 GB、首次导出 Chromium ≈ 440 MB、上传视频最大 2 GB | — |
+| 内存 | CPU 推理建议 ≥ 8 GB，长音频需要更多 | — |
 
-**Video bytes are served as plain static files**, not through a dedicated API proxy: the browser, the Remotion player and the export bundle all load `/videos/<id>.<ext>` from the `public` root (`express.static` in production, Vite's `publicDir` middleware in development), which supports `GET`, `HEAD` and HTTP `Range` (`206` / `416`).
+### 仅语音识别 / 强制对齐需要
 
-Responses use a localized JSON error shape (`{ error, code }`):
+- Python 3.14（推荐）或 3.12，项目内虚拟环境 `.venv`
+- `lib/qwen/`：本地模型与推理源码（来自 [HaujetZhao/Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF)，约 1.5 GB，不随仓库分发）
 
-- `400` — malformed upload request or missing file part.
-- `413` — file exceeds the 2 GB limit.
-- `422` — the upload is not a valid video (no video stream, invalid or missing duration/dimensions/fps, or unparseable probe output).
-- `404` — unknown video id or unknown `/api` route.
-- `503` — `ffprobe` is not available.
-- `504` — the probe exceeded the 30 second `ffprobe` timeout.
+缺少这两项时，**上传视频、导入 TXT、编辑字幕、预览与导出仍可正常使用**，只有「语音识别 / 强制对齐」会失败。
 
-Metadata returned by `POST /api/videos`:
+### 仅字幕预览 / 导出需要
 
-```ts
-interface VideoMetadata {
-  id: string // UUID
-  url: string // /videos/<id>.<ext> (server-derived static path)
-  filename: string // sanitized original filename
-  size: number // bytes
-  duration: number // seconds
-  width: number // display width, rotation applied
-  height: number // display height, rotation applied
-  fps: number // from avg_frame_rate, r_frame_rate fallback
-  codec: string // probed video codec name
-}
+- `public/SmileySans-Oblique.ttf`
+- `public/JetBrainsMono-Bold.ttf`
+
+两个字体文件被 `.gitignore` 忽略，不随仓库分发。缺少任一个都会让 Remotion 的 `loadFont()` 失败并取消渲染，**导出直接失败**。
+
+## 快速开始
+
+```powershell
+pnpm install
+pnpm dev          # http://localhost:5173
 ```
 
-Notes:
+开发模式使用 Vite 中间件与 HMR：`tsx watch server.ts` 会在服务端文件变化时重启，客户端走 Vite 热更新。
 
-- **Temporary storage only.** Uploads live in a unique `fs.mkdtemp` directory under `os.tmpdir()`; nothing is written into the repo. Files are removed on `DELETE`, on failed uploads/probes, and the whole directory is removed during graceful shutdown (after the HTTP server closes).
-- **No transcoding.** Files are stored byte-for-byte as uploaded; the server does not re-encode or remux.
-- The shared `VideoMetadata` type lives in `src/video-types.ts` and is importable from both server and client code.
+最小可用（暂不配置语音识别）：
 
-## Persistent workspace
+1. 把 `SmileySans-Oblique.ttf`、`JetBrainsMono-Bold.ttf` 放进 `public/`
+2. `pnpm install`
+3. `pnpm dev`
+4. 打开页面，点「选择视频」→「上传字幕」→ 编辑 →「导出」
 
-The app keeps exactly **one** resumable workspace on disk:
+首次导出会自动下载 Remotion 的 Chromium（本机缓存约 440 MB），需要能访问网络；之后可离线导出。
 
-- Location: `WORKSPACE_DIR`, default `./storage/workspace` (git-ignored).
-- `workspace.json` — `revision`, the current video metadata (including `url` and `publicPath`), the video filename, all subtitle segments/tokens/`units` with timings, and `updatedAt`. Written atomically (temp file + rename) and serialized so writes never interleave.
-- `public/videos/<id>.<ext>` — the video bytes (git-ignored). The JSON **never** embeds the video; playback, the player and the export bundle all load it as the static file `/videos/<id>.<ext>`.
+## 部署说明
 
-Behaviour:
+### 部署形态与限制
 
-- **Restore on load.** `GET /api/workspace` returns the saved document; the client applies it once before enabling autosave, so the built-in sample/empty state can never overwrite the disk copy.
-- **Autosave.** TXT import, edits, deletes, merges, and completed ASR/align jobs schedule a debounced (600 ms) `PUT /api/workspace` carrying the revision they were based on.
-- **Uploads.** A new video is only adopted after the server has copied the file into `public/videos` and durably written the JSON (subtitles reset to empty). Any upload/probe/write failure leaves the previous workspace untouched. The old video file is removed only after the new document is durable.
-- **Migration from older workspaces.** Documents written before the `public/videos` move referenced `videos/<name>` inside the workspace directory and the `/api/videos/:id/content` URL. On startup such a file is **copied** (never moved) into `public/videos`, the copy is size-checked, the JSON is rewritten, and only then is the legacy file removed. If anything fails the original JSON and file stay exactly as they were, so no subtitles or video data are lost. Existing subtitles are never reset by this migration.
-- **Conflicts.** A stale revision returns `409 WORKSPACE_CONFLICT` (shown in the UI) instead of silently overwriting; saving can never swap the video identity.
-- **Corruption.** If `workspace.json` cannot be parsed it is left byte-for-byte untouched, the API reports `corrupt: true` / `writable: false`, and all writes return `409 WORKSPACE_CORRUPT`.
-- **Leaving the page never deletes anything**; pending edits are flushed instead.
-- **Not restored:** running ASR/align jobs, open editors/popups and drafts. Only saved data comes back.
-- **Paths** are validated: only a bare filename is stored, and the resolved file must stay inside `public/videos/`; `publicPath` must be exactly `videos/<name>` with no traversal.
+- **单实例、单工作区、单用户**：应用只维护一个 `workspace.json`，同一时间只有一个视频和一串字幕。
+- **没有内置鉴权**：能访问端口的人都能上传/删除视频、触发识别与导出。请部署在本机或可信内网，或放在带认证的反向代理之后。
+- **推理串行**：同时最多 1 个识别任务运行，最多 4 个排队，单任务 30 分钟超时。
+- **导出串行**：同一时间只允许一个导出；导出期间会锁定当前视频（删除会被拒绝）。
+- **持久化目录必须使用本地磁盘**，不要把 `storage/` 放在会被清理的临时目录。
 
-The app is always served from the root path (`/`); there is no configurable base path.
+### 1. 获取代码并安装依赖
 
-## Speech recognition API
-
-The ASR router (`asr-server.ts`) is mounted at `/api` **before** the media router, so `/api/asr/*` is never swallowed by the media router's `/videos/:id` catch-all. Unknown `/api/asr/*` paths return a JSON `404`.
-
-A job extracts audio from the registered video with FFmpeg (`-vn -ac 1 -ar 16000 -c:a pcm_s16le`) into a private per-job directory, then runs the tracked worker with the **project virtualenv** Python (`.venv\Scripts\python.exe python\qwen_worker.py`). The worker imports the unmodified `lib/qwen/qwen_asr_gguf` **source** package, so the frozen `transcribe.exe` is never invoked:
-
-```
-.venv\Scripts\python.exe python\qwen_worker.py --mode <asr|align> --input <job>/input.wav \
-    --request <job>/request.json --output <job>/result.json --runtime-dir lib/qwen
+```powershell
+git clone <repository-url> cjzmw
+cd cjzmw
+pnpm install --frozen-lockfile
 ```
 
-Environment is configured before any inference import: `PYTHONUTF8=1`, `PYTHONNOUSERSITE=1`, `VK_ICD_FILENAMES=none`, `GGML_VULKAN=0`, the runtime `bin/` added to `PATH` and `os.add_dll_directory`, and the runtime root prepended to `sys.path`. Inference is CPU-only (`use_dml=False`).
+### 2. 安装 ffmpeg / ffprobe
 
-**Setup:** run `python\setup.ps1` (or follow [`python/SETUP.md`](python/SETUP.md)) to create `.venv` from the installed Python 3.14 and install `python\requirements.txt`; nothing is installed globally. `.venv/`, `.python/` and `.cache/` are git-ignored.
-
-Limits: force alignment has **no duration cap and no character cap** — the whole audio and the supplied text are aligned in one call; only an empty snapshot is rejected. The aligner still runs with its fixed decoder context, so long audio or very long text can fail at the runtime level; such errors are surfaced as-is rather than pre-empted or chunked. Independent structural limits still apply: ≤400 segments, ≤4000 tokens, 512 kb body.
-
-| Route | Description |
-| --- | --- |
-| `POST /api/videos/:id/asr` | Queues a transcription of a registered video and returns `202 { id, kind: "asr", status }`. `404` for an unknown video, `409 ASR_BUSY` when that video already has an active job, `409 ASR_QUEUE_FULL` when the bounded queue is full. |
-| `POST /api/videos/:id/align` | Queues a force alignment of the same audio against the supplied subtitle snapshot `{ segments: [{ id, tokens: [{ id, text }] }] }` (body ≤ 512 kb) and returns `202 { id, kind: "align", status }`. Token ids and text are echoed back verbatim; `400 EMPTY_SUBTITLES` / `ALIGN_INVALID` / `ALIGN_DUPLICATE_ID` / `ALIGN_TOO_MANY_SEGMENTS` / `ALIGN_TOO_MANY_TOKENS` describe validation failures (there is no text-length limit). |
-| `GET /api/asr/jobs/:id` | Job status: `queued` (with `queuePosition`), `running`, `completed` or `failed`, plus `kind`. Completed jobs also return `result`. |
-| `DELETE /api/asr/jobs/:id` | Cancels a queued/running job (killing the tracked process tree) or drops a finished one. Always `204`. |
-
-Job response shape (no filesystem path is ever included):
-
-```ts
-interface AsrJobResponse {
-  id: string
-  videoId: string
-  kind: 'asr' | 'align'
-  status: 'queued' | 'running' | 'completed' | 'failed'
-  queuedAt: string // ISO timestamp
-  startedAt?: string
-  finishedAt?: string
-  queuePosition?: number // 1-based, while queued
-  error?: { code: string; message: string } // localized
-  log?: { stream: 'stdout' | 'stderr'; line: string }[] // bounded tail
-  result?: {
-    kind: 'asr' | 'align'
-    text: string // transcript (asr) or the aligned snapshot text (align)
-    srt: string // SRT for asr, empty string for align
-    raw: { text: string; start: number; end: number }[] // seconds
-    segments: SubtitleSegment[] // tokens with timings, ready for the UI
-    durationMs: number
-  }
-}
+```powershell
+winget install --id Gyan.FFmpeg -e
+ffmpeg -version
+ffprobe -version
 ```
 
-Behaviour notes:
+若没有加入 `PATH`，用环境变量显式指定（服务子进程会继承）：
 
-- **CPU bounded.** Only one inference runs at a time; further requests wait in a queue of at most 4 jobs. Every queued and running job counts towards the video pin.
-- **Bounded jobs.** A job is aborted — and its Windows process tree killed with `taskkill /PID <pid> /T /F` (no shell, tracked pid only) — after 30 minutes. Stdout/stderr are kept as a bounded tail (40 lines, 400 chars each).
-- **Pinned media.** While a video is referenced by a queued or running job, `DELETE /api/videos/:id` returns `409 VIDEO_BUSY`. The audio is extracted into the job directory before the engine starts.
-- **Shutdown.** `SIGINT`/`SIGTERM` stop ASR jobs (killing their process trees) and close idle connections so shutdown does not wait for a long transcription; ASR jobs are cleaned up before the media temp directory.
-- `src/subtitle-timing.ts` (pure, shared with the client) expands each raw ASR item into per-code-point timings, splits SRT/transcript text into word tokens with `Intl.Segmenter`, and maps tokens onto the ordered raw characters. A token matching one whole raw item keeps the model bounds (`timingSource: 'model'`); fragments and recombinations get interpolated bounds (`'interpolated'`); unmatched text stays `null` / `'unmatched'` and is never extrapolated. Each timed token also carries `units: { char, start, end }[]` so later split/merge edits can remap timings. Example: raw `字幕工具 [1,2]` maps to `字幕 [1,1.5]` and `工具 [1.5,2]`.
-
-## MP4 export API
-
-The export router (`export-server.ts`) renders the same Remotion composition the player shows (`src/VideoStage.tsx`) to an MP4 with `@remotion/bundler` + `@remotion/renderer`. The bundle is built once and cached per video, and the videos are served from the app's `public/videos` directory, so the render page reads them same-origin. One export runs at a time, and a running export pins its video (`DELETE /api/videos/:id` → `409 VIDEO_BUSY`).
-
-Rendering always uses **Remotion's own Chromium** (`chromeMode: 'chrome-for-testing'`), downloaded by `ensureBrowser` on the first export and reused afterwards — the system Chrome/Edge is never launched. Remotion's renderer logs (bundle, browser download, composition, frame progress) are written to the server console with an `[export <id>]` prefix; set `REMOTION_LOG_LEVEL` to change the verbosity.
-
-| Route | Description |
-| --- | --- |
-| `POST /api/export` | Queues a render of the current video with the posted subtitles (`{ segments, styles }`) and returns `202 { id, status, progress, message, filename, downloadUrl }`. `409 NO_VIDEO` without a video, `409 EXPORT_BUSY` while another render runs, `400 NO_SUBTITLES` for an empty subtitle list. |
-| `GET /api/export/:id` | Job status (`preparing` \| `rendering` \| `completed` \| `failed` \| `cancelled`) plus `0`-`1` progress and the last message. |
-| `GET /api/export/:id/file` | Downloads the finished MP4 (`Content-Disposition: attachment`). |
-| `DELETE /api/export/:id` | Cancels a running render (Remotion cancel signal) and removes its output file. |
-
-Rendering is server-side, so the exported file includes the source audio and is independent of the browser's WebCodecs support. The client polls every 800 ms, shows a progress bar with a cancel button, and triggers the download when the job completes. On `SIGINT`/`SIGTERM`, running exports are cancelled and `storage/exports` is removed.
-
-## How SSR works
-
-`index.html` is the single template and contains two placeholders:
-
-- `<!--app-head-->` — replaced with markup returned by the server render (empty by default).
-- `<!--app-html-->` — replaced with the server-rendered React markup.
-
-**Development** (`server.ts`): a `node:http` server is created from the Express app and handed to Vite as `server.hmr.server`, so HMR shares the same HTTP server and port. Vite runs in `middlewareMode` with `appType: 'custom'`. `index.html` is re-read from disk on every request, then passed through `vite.transformIndexHtml` to inject HMR/client scripts, and `vite.ssrLoadModule('/src/entry-server.tsx')` renders the app with fresh module state. `vite.ssrFixStacktrace` maps errors back to source.
-
-**Production**: `dist/client` is served statically and `dist/server/entry-server.js` is imported once at startup to render requests.
-
-**HMR for SSR-only modules**: `vite.config.ts` registers a small `hotUpdate` plugin. When a module changes in the `ssr` environment and the client module graph has no matching module (for example `src/entry-server.tsx`), React Fast Refresh cannot apply the update, so the plugin sends a `full-reload` to the client and returns `[]`. Otherwise it returns nothing and React refresh handles the update normally.
-
-**Shutdown**: `SIGINT`/`SIGTERM` close the HTTP server, close the Vite dev server, then remove the media temp directory, with a 10 second timeout that forces exit if shutdown hangs. Listen errors are logged and exit with code 1.
-
-## Project layout
-
-```
-index.html               # SSR template with app-head / app-html placeholders
-server.ts                # Express 5 + node:http server (dev middleware + prod static/SSR)
-media-server.ts          # /api media router: upload, probe, range streaming, delete
-asr-server.ts            # /api ASR router: FFmpeg audio extraction + Qwen ASR jobs
-export-server.ts         # /api export router: Remotion bundling + MP4 render jobs
-src/VideoStage.tsx       # Remotion composition (video + burn-in subtitles), shared by player and export
-src/remotion-entry.tsx   # registerRoot entry bundled by @remotion/bundler
-src/remotion-root.tsx    # Composition registry + calculateMetadata for the exporter
-src/export-client.ts     # Client helpers for the export job API
-src/video-types.ts       # Shared VideoMetadata type
-src/subtitle-types.ts    # Shared SubtitleToken / SubtitleSegment types
-src/subtitle-timing.ts   # Shared raw-ASR -> token timestamp mapping (pure)
-vite.config.ts           # Client build -> dist/client, SSR full-reload HMR plugin
-vite.config.ssr.ts       # SSR build -> dist/server
-tsconfig.app.json        # Client sources (DOM libs)
-tsconfig.node.json       # Vite configs
-tsconfig.server.json     # server.ts + media/asr routers + src/entry-server.tsx (Node types)
-src/entry-client.tsx     # hydrateRoot
-src/entry-server.tsx     # render(url) -> { html, head }
-src/App.tsx              # Application root
-src/subtitle-timing.test.ts # node:test coverage for the timestamp mapping
+```powershell
+$env:FFMPEG_PATH  = 'C:\ffmpeg\bin\ffmpeg.exe'
+$env:FFPROBE_PATH = 'C:\ffmpeg\bin\ffprobe.exe'
 ```
 
-## Production run
+- `ffprobe` 用于上传时读取视频元数据，缺失时上传返回 `503 FFPROBE_UNAVAILABLE`。
+- `ffmpeg` 用于抽取 16 kHz 单声道音频，缺失时识别任务失败并报 `FFMPEG_UNAVAILABLE`。
 
-```bash
+### 3. 准备 Qwen3-ASR 运行时
+
+语音识别与强制对齐使用 **[HaujetZhao/Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF)**——Qwen3-ASR 与 Qwen3-ForcedAligner 的 ONNX + GGUF 混合推理实现。本项目直接引用其源码包与模型，不做修改；`lib/qwen/` 被 `.gitignore` 忽略，需要手动放入。
+
+#### lib 放置结构
+
+```text
+lib/qwen/
+├─ model/                                     # 模型权重（约 1.5 GB）
+│  ├─ qwen3_asr_encoder_frontend.int4.onnx
+│  ├─ qwen3_asr_encoder_backend.int4.onnx
+│  ├─ qwen3_asr_llm.q4_k.gguf
+│  ├─ qwen3_aligner_encoder_frontend.int4.onnx
+│  ├─ qwen3_aligner_encoder_backend.int4.onnx
+│  └─ qwen3_aligner_llm.q4_k.gguf
+└─ qwen_asr_gguf/                             # 上游 Python 源码包（必须可被 import）
+   ├─ __init__.py
+   └─ inference/
+      ├─ __init__.py
+      ├─ asr.py                               # ASR 引擎
+      ├─ asr_worker.py                        # 异步编码进程
+      ├─ aligner.py                           # 强制对齐
+      ├─ encoder.py / llama.py                # ONNX / llama.cpp 封装
+      ├─ exporters.py / chinese_itn.py        # SRT/JSON/TXT 导出、中文数字规整
+      ├─ schema.py / utils.py
+      ├─ assets/                              # 语言处理资源（如韩语词典）
+      └─ bin/                                 # llama.cpp 预编译二进制（Windows x64）
+         ├─ llama.dll
+         ├─ ggml.dll、ggml-base.dll、ggml-cpu-*.dll
+         ├─ ggml-vulkan.dll、ggml-rpc.dll
+         ├─ mtmd.dll、libomp140.x86_64.dll
+         └─ llama-quantize.exe
+```
+
+各部分的来源与放置位置：
+
+| 内容 | 来源 | 放置位置 |
+| --- | --- | --- |
+| 模型权重（上方 6 个文件） | 上游 [models release](https://github.com/HaujetZhao/Qwen3-ASR-GGUF/releases/tag/models) 的模型压缩包 | 解压到 `lib/qwen/model/` |
+| Python 源码包 `qwen_asr_gguf/` | 上游仓库根目录的同名目录 | `lib/qwen/qwen_asr_gguf/` |
+| llama.cpp 预编译 DLL | [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) 中的 `llama-bXXXX-bin-win-vulkan-x64.zip` | `lib/qwen/qwen_asr_gguf/inference/bin/` |
+
+放置说明：
+
+- 本项目只使用 `model/` 与 `qwen_asr_gguf/`；上游的 `transcribe.exe`、`internal/`、`export/`、`readme.md` 可以不复制，也不参与运行。
+- DLL 必须放在 `qwen_asr_gguf/inference/bin/`：`python/qwen_worker.py` 启动时会把该目录加入 `PATH` 和 Windows DLL 搜索目录（上游文档写作 `qwen_asr_gguf/bin/`，与本项目的目录结构不同）。
+- ASR 可选 0.6B 或 1.7B 权重，保持上方列出的默认文件名即可，worker 按 `qwen_asr_gguf/inference/schema.py` 中的默认文件名加载。
+- 运行时目录可以用 `QWEN_ASR_DIR` 指向别处，结构保持不变。
+
+#### 创建虚拟环境
+
+在项目内创建虚拟环境（不污染全局 Python）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File python\setup.ps1
+```
+
+脚本会使用 `py -3.14` 创建 `.venv`、安装 `python/requirements.txt` 并验证导入。若本机没有合适的 Python，可按 [python/SETUP.md](python/SETUP.md) 用 `uv` 创建项目内的 3.12 解释器。
+
+验证运行时：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0,'lib/qwen'); import qwen_asr_gguf.inference as m; print(m.QwenASREngine, m.QwenForcedAligner)"
+```
+
+说明：
+
+- worker 直接以源码方式导入 `lib/qwen/qwen_asr_gguf`，不需要把它安装进 venv，也不需要改上游代码。
+- worker 以纯 CPU 模式启动：`VK_ICD_FILENAMES=none`、`GGML_VULKAN=0`，无需 GPU 驱动。
+- 识别语言固定为中文（`language: 'Chinese'`），界面暂不提供语言切换。
+- 可用 `QWEN_ASR_DIR`、`QWEN_PYTHON` 指向别处的运行时/解释器（见[环境变量](#环境变量)）。
+
+### 4. 放置字幕字体
+
+```text
+public/SmileySans-Oblique.ttf
+public/JetBrainsMono-Bold.ttf
+```
+
+字体只影响播放器与烧录字幕；左侧编辑区使用系统字体。
+
+### 5. 构建
+
+```powershell
 pnpm build
+```
+
+该命令依次执行类型检查（`tsc -b`）、客户端构建与 SSR 构建，产物为：
+
+- `dist/client` — 浏览器静态资源
+- `dist/server/entry-server.js` — SSR 渲染入口
+
+### 6. 启动
+
+```powershell
+pnpm start          # 等价于 node server.ts --production
+```
+
+默认端口 **3000**（开发默认 5173），可通过 `PORT` 修改：
+
+```powershell
+$env:PORT = '8080'
 pnpm start
 ```
 
-`pnpm start` and `pnpm preview` both run `node server.ts --production`. Setting `NODE_ENV=production` has the same effect:
+服务监听所有网卡，访问 `http://<主机>:3000`。生产模式从 `dist/client` 提供页面与资源，从 `public/` 提供视频和字体。
+
+设置 `NODE_ENV=production` 与 `--production` 等价：
 
 ```powershell
-$env:NODE_ENV="production"; pnpm start
+$env:NODE_ENV = 'production'
+pnpm start
 ```
 
-## React Compiler
+### 7. 预下载 Chromium（离线/内网部署建议）
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+导出始终使用 Remotion 自带的 Chromium（`chrome-for-testing`，带 H.264/AAC 解码），首次导出时下载到 `node_modules/.remotion/`：
 
-## Expanding the Oxlint configuration
+```powershell
+node -e "import('@remotion/renderer').then(({ ensureBrowser }) => ensureBrowser({ chromeMode: 'chrome-for-testing' }))"
+```
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+下载完成后即可离线渲染。注意：重新 `pnpm install` 或删除 `node_modules` 后需要再次下载，建议保留或单独备份 `node_modules/.remotion`。
 
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
+### 8. 目录与权限
+
+| 路径 | 用途 | 说明 |
+| --- | --- | --- |
+| `storage/workspace/` | `workspace.json`：视频信息 + 全部字幕 | 持久数据，务必备份 |
+| `public/videos/` | 当前视频文件 | 启动时自动创建；替换视频时清理旧文件 |
+| `storage/exports/` | 导出临时文件 | 进程退出时清空；导出结果由浏览器下载 |
+| `node_modules/.remotion/` | Chromium 与浏览器缓存 | 首次导出创建 |
+| `lib/qwen/` | ASR 模型与源码 | 只需读权限 |
+
+运行用户必须对 `storage/`、`public/videos/`、`node_modules/.remotion/` 有写权限。
+
+### 9. 反向代理配置
+
+上传是单次 ≤ 2 GB 的 multipart 请求，识别/导出进度是短轮询（无 WebSocket/SSE），代理主要需要放开上传大小与超时：
+
+```nginx
+server {
+    listen 80;
+    server_name subtitle.example.com;
+
+    client_max_body_size 2100m;
+    proxy_request_buffering off;   # 避免 2 GB 上传在代理层再写一份临时文件
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
 }
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+视频以静态文件形式从 `/videos/<id>.<ext>` 提供，支持 `HEAD` 与 `Range`（`206`/`416`），无需额外代理规则。
+
+### 10. 作为 Windows 服务运行（可选）
+
+使用 [NSSM](https://nssm.cc/)：
+
+```powershell
+nssm install cjzmw "C:\Program Files\nodejs\node.exe" "server.ts --production"
+nssm set cjzmw AppDirectory C:\path\to\cjzmw
+nssm set cjzmw AppEnvironmentExtra NODE_ENV=production PORT=3000
+nssm set cjzmw AppStdout C:\path\to\cjzmw\storage\server.log
+nssm set cjzmw AppStderr C:\path\to\cjzmw\storage\server.err.log
+nssm start cjzmw
+```
+
+进程收到 `SIGINT`/`SIGTERM` 时会优雅关闭：关闭 HTTP 服务、取消识别/导出任务、清理临时文件；10 秒内未完成则强制退出。
+
+### 11. 部署自检
+
+1. 访问 `http://<主机>:3000/`，页面正常渲染
+2. 「选择视频」后能看到文件名、时长、分辨率、帧率、编码
+3. 「语音识别」任务经历 `排队 → 运行 → 完成`，字幕带逐字时间戳
+4. 「导出」进度到 100%，浏览器自动下载 MP4
+
+## 使用说明
+
+### 界面结构
+
+顶部工具栏是一套固定流程：**选择视频 → 语音识别 / 上传字幕 → 强制对齐 → 导出**。左侧是字幕分段列表（逐字校订），右侧是画面预览，字幕列表上方的状态提示会显示任务进度与错误。
+
+### 1. 选择视频
+
+点击「选择视频」，选取本地视频（`video/*`）。服务端用 `ffprobe` 读取元数据后把文件复制到 `public/videos/`，页面随即显示预览与元信息。
+
+- 上限 2 GB（超出返回 413）；无法解析的文件返回 422
+- **新视频会替换工作区里已有的视频，并把字幕清空**
+
+### 2. 语音识别
+
+选好视频后点「语音识别」。任务在服务端排队执行，界面显示「排队中（前面还有 N 个任务）」「正在识别语音…」等状态，可随时点「取消识别」。
+
+完成后字幕按段落填入左侧列表，每个词带有逐字时间戳：
+
+- **模型时间戳** — 模型直接给出的整段边界
+- **推算时间戳** — 由字符插值得到的词/字边界
+- **无可靠时间戳** — 文本无法匹配到识别结果
+
+### 3. 上传 TXT 字幕
+
+点「上传字幕」选择 `.txt` 文件（UTF-8）：
+
+- **一行 = 一段字幕**，空行忽略
+- 仅支持 `.txt`；编码不是 UTF-8 时会提示另存为 UTF-8
+- 导入会**替换**当前所有字幕，导入后这些段落没有时间戳
+
+### 4. 强制对齐
+
+已经有字幕文本（识别结果或 TXT 导入）且已选择视频时，点「强制对齐」，用音频为每个词计算时间戳。限制：
+
+- 最多 400 段、4000 个词元，请求体 ≤ 512 kb
+- 编辑字幕之后，列表上方会提示「字幕有变化，需要重新强制对齐」
+
+### 5. 逐字校订
+
+| 操作 | 效果 |
+| --- | --- |
+| 点击某一段 | 播放器跳到该段开始时间 |
+| 「编辑」 | 打开编辑框；段落内按回车可换行，保存后仍是同一段 |
+| 编辑框「插入段落」 | 按光标位置把当前段拆成两段，并立即保存 |
+| 「向前合并」/「向后合并」 | 与相邻段合并，保留当前段的文字 |
+| 点击某个词 | 弹窗显示开始 / 结束 / 持续时间，并可选择样式 |
+| 样式 | `默认样式`（常规）与 `重点`（更大更重，朗读时放大并带粉色发光） |
+
+样式只作用于播放器与导出画面，不改变左侧编辑区的排版。所有编辑都会自动保存。
+
+### 6. 画面预览
+
+右侧 Remotion Player 按视频真实分辨率与帧率播放，字幕层级、换行、样式与导出结果完全一致（同一份 composition）。
+
+### 7. 导出 MP4
+
+点「导出」后，服务端用 Remotion 渲染**当前视频 + 当前字幕快照**（渲染开始后再编辑不影响这次导出），完成后浏览器自动下载 MP4。
+
+- 需要已选视频且至少有一段字幕（否则接口返回 `400 NO_SUBTITLES`）
+- 界面显示进度条与「取消」；服务端同一时间只跑一个导出
+- 渲染在服务端完成，带有原始音轨，不依赖浏览器的 WebCodecs
+- 导出耗时约与视频时长成正比；遇到单帧解码头超时可调大 `EXPORT_TIMEOUT_MS`
+
+### 8. 工作区自动保存与恢复
+
+- TXT 导入、编辑、删除、合并、识别/对齐完成都会触发 600 ms 防抖自动保存
+- 刷新页面或重启服务后自动恢复视频与字幕；恢复完成前不会开始自动保存，避免覆盖磁盘上的数据
+- 多标签页同时编辑时，落后的一方会看到「工作区已在其他标签页被修改，请刷新后再保存」
+- 不恢复：进行中的识别/对齐任务、打开的编辑框与草稿
+- `workspace.json` 损坏时原文件保持不变，界面提示「工作区数据无法读取」并停止自动保存
+
+### 9. 键盘操作
+
+- `Esc`：关闭编辑框 / 词元弹窗
+- 词元上 `Enter` 或空格：打开词元信息
+
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PORT` | 开发 `5173`，生产 `3000` | HTTP 端口 |
+| `NODE_ENV` | 未设置 | 设为 `production` 时等价于 `--production` |
+| `FFPROBE_PATH` | `ffprobe` | `ffprobe` 可执行文件绝对路径 |
+| `FFMPEG_PATH` | `ffmpeg` | `ffmpeg` 可执行文件绝对路径 |
+| `QWEN_ASR_DIR` | `lib/qwen` | Qwen3-ASR 运行时目录（`model/` + `qwen_asr_gguf/`） |
+| `QWEN_PYTHON` | `.venv\Scripts\python.exe` | worker 解释器路径 |
+| `WORKSPACE_DIR` | `storage/workspace` | 工作区 JSON 目录 |
+| `PUBLIC_DIR` | `public` | 静态根目录；视频存放在 `<PUBLIC_DIR>/videos` |
+| `EXPORT_DIR` | `storage/exports` | 导出临时目录 |
+| `EXPORT_CONCURRENCY` | `1` | Remotion 渲染并发（每帧并行解码反而更慢，默认 1） |
+| `EXPORT_TIMEOUT_MS` | `180000` | 渲染单步超时，最小 `30000` |
+| `REMOTION_LOG_LEVEL` | `verbose` | Remotion 日志级别：`trace`/`verbose`/`info`/`warn`/`error` |
+
+## 常见问题
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| 上传失败，提示 ffprobe 不可用（`503 FFPROBE_UNAVAILABLE`） | `ffprobe` 不在 `PATH`；安装 ffmpeg 或设置 `FFPROBE_PATH` |
+| 上传返回 413 | 文件超过 2 GB；先压缩/裁剪再上传 |
+| 上传返回 422 | 文件没有视频流或元数据无法解析（例如纯音频、损坏文件） |
+| 识别任务失败，`FFMPEG_UNAVAILABLE` | 无法启动 `ffmpeg`；检查 `FFMPEG_PATH`/`PATH` |
+| 识别任务失败，`ASR_RUNTIME_UNAVAILABLE` | `.venv` 解释器或 `lib/qwen` 缺失；执行 `python\setup.ps1` 并检查 `QWEN_PYTHON` |
+| 识别一直显示排队 | 同一时间只跑一个任务，队列上限 4；等前一个任务结束 |
+| 识别很慢 | CPU 推理；长视频耗时显著，可在空闲机器上运行，单任务 30 分钟后会被终止 |
+| 导出失败 | 检查 `public/` 下两个字体文件是否齐全、`node_modules/.remotion` 是否可写；查看服务端 `[export ...]` 日志 |
+| 导出按钮无反应/报错 | 需要先有视频和至少一段字幕 |
+| 播放器没有字幕字体 | 字体文件缺失或未重启服务；确认 `public/` 下两个 TTF 可访问 |
+| 保存时提示「工作区已在其他标签页被修改」 | 另一个标签页写入了更新版本；刷新页面后继续 |
+| 重启后字幕还在但视频丢失 | `public/videos/` 中的文件被清理；重新上传视频（字幕会重置） |
+| `pnpm start` 报未知文件扩展名 | Node 版本过低（需 ≥ 24，原生执行 TypeScript） |
+
+## HTTP API
+
+所有接口挂在 `/api` 下，返回 JSON；未知 `/api` 路径返回 `404 { error, code }`。视频字节本身走静态路径 `/videos/<id>.<ext>`。
+
+### 视频
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/videos` | `multipart/form-data`，字段名 `video`，单个文件 ≤ 2 GB；用 `ffprobe` 探测后落盘，返回 `201` + `VideoMetadata` |
+| `DELETE` | `/api/videos/:id` | 删除视频，`204`；被识别/导出任务占用时返回 `409 VIDEO_BUSY` |
+
+```ts
+interface VideoMetadata {
+  id: string          // UUID
+  url: string         // /videos/<id>.<ext>
+  publicPath?: string // 相对 public 根目录的路径，如 videos/<id>.mp4（旧文档可能没有）
+  filename: string    // 清理后的原始文件名
+  size: number        // 字节
+  duration: number    // 秒
+  width: number       // 显示宽度（已应用旋转）
+  height: number      // 显示高度（已应用旋转）
+  fps: number         // avg_frame_rate，回退 r_frame_rate
+  codec: string       // 视频编码
+}
+```
+
+### 工作区
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/workspace` | 返回 `{ workspace, writable, corrupt, restoreError, videoFileMissing }` |
+| `PUT` | `/api/workspace` | 提交 `{ revision, video, segments }`；版本不匹配返回 `409 WORKSPACE_CONFLICT` |
+
+`workspace` 文档结构：`{ revision, video, segments, updatedAt }`。写入是原子的（临时文件 + rename）且串行化；视频身份不能通过保存被替换。
+
+### 语音识别 / 强制对齐
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/videos/:id/asr` | 排队识别，`202 { id, kind: "asr", status }`；`409 ASR_BUSY` / `409 ASR_QUEUE_FULL` |
+| `POST` | `/api/videos/:id/align` | 排队对齐，body 为 `{ segments: [{ id, tokens: [{ id, text }] }] }`（≤ 512 kb），`202` |
+| `GET` | `/api/asr/jobs/:id` | 任务状态 `queued`（带 `queuePosition`）/ `running` / `completed` / `failed`，完成时带 `result` |
+| `DELETE` | `/api/asr/jobs/:id` | 取消排队/运行中的任务（杀掉进程树）或丢弃已完成任务，始终 `204` |
+
+任务结果 `result` 包含 `kind`、`text`、`srt`、`raw: [{ text, start, end }]`（秒）以及带逐字时间戳的 `segments`。
+
+### 导出
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/export` | body `{ segments, styles }`，`202` 返回任务（`409 NO_VIDEO` / `409 EXPORT_BUSY` / `400 NO_SUBTITLES`） |
+| `GET` | `/api/export/:id` | 状态 `preparing` / `rendering` / `completed` / `failed` / `cancelled`、`progress`(0-1)、`message` |
+| `GET` | `/api/export/:id/file` | 下载渲染完成的 MP4（`Content-Disposition: attachment`） |
+| `DELETE` | `/api/export/:id` | 取消渲染并删除输出文件 |
+
+## 开发与测试
+
+| 命令 | 说明 |
+| --- | --- |
+| `pnpm dev` | `tsx watch server.ts`，端口 5173，Vite 中间件 + HMR |
+| `pnpm build` | `tsc -b` + 客户端构建 + SSR 构建 |
+| `pnpm start` / `pnpm preview` | `node server.ts --production`，端口 3000 |
+| `pnpm lint` | Oxlint |
+| `pnpm test` | `node --test tests/*.test.ts`（Node 24 原生执行 TS） |
+| `pnpm typecheck-tests` | 对测试与配置文件做类型检查 |
+
+测试覆盖字幕时间戳映射、断行、样例数据、工作区持久化与 ASR 路由。改动后建议至少执行：
+
+```powershell
+pnpm test
+pnpm build
+```
+
+## 项目结构
+
+```text
+index.html                # SSR 模板，含 <!--app-head--> / <!--app-html--> 占位
+server.ts                 # Express 5 + node:http（开发中间件 / 生产静态 + SSR）
+media-server.ts           # /api 视频上传、探测、删除
+workspace-server.ts       # /api 工作区读取、保存、原子写盘
+asr-server.ts             # /api 语音识别与强制对齐任务队列
+export-server.ts          # /api 导出：Remotion 打包 + MP4 渲染
+python/qwen_worker.py     # Qwen3-ASR / 强制对齐 worker
+python/setup.ps1          # 项目内虚拟环境一键准备
+python/requirements.txt   # worker 依赖（CPU only）
+python/SETUP.md           # worker 环境与请求/结果格式
+src/App.tsx               # 主界面：工具栏、字幕列表、编辑与任务状态
+src/VideoStage.tsx        # Remotion composition（视频 + 烧录字幕），预览与导出共用
+src/remotion-root.tsx     # composition 注册与 calculateMetadata
+src/player-fonts.ts       # 通过 loadFont 加载 public/ 下的字幕字体
+src/subtitle-timing.ts    # 原始 ASR → 逐字时间戳映射（纯函数，前后端共用）
+src/subtitle-sample.ts    # 未恢复工作区时的示例字幕
+src/subtitles.css         # 播放器字幕样式与词元样式类
+tests/                    # node:test 测试
+vite.config.ts            # 客户端构建 + SSR 模块热更新插件
+vite.config.ssr.ts        # SSR 构建
+```
+
+## 实现要点
+
+- **SSR**：`index.html` 中的两个占位符分别注入 head 与 React 标记；开发模式每次请求重新读取模板并经由 `vite.transformIndexHtml`，生产模式使用构建产物。
+- **视频即静态文件**：上传后写入 `public/videos/`，浏览器、播放器和导出 bundle 都以同源 `/videos/<id>.<ext>` 访问，天然支持 Range 请求。
+- **临时目录**：上传先落在系统临时目录，失败即清理；进程退出时删除临时目录。
+- **导出渲染**：`@remotion/bundler` 打包一次并按视频缓存；`@remotion/renderer` 用自带 Chromium 单帧顺序渲染（并发 1），带取消信号与进度。
+- **时间戳模型**：识别结果按字符展开；整段匹配的词保留模型边界（`model`），碎片与重组按字符插值（`interpolated`），无法匹配的文本保持 `null`（`unmatched`）而不做外推。
+
+## 模型使用说明：不使用视觉模型
+
+本项目**不使用任何视觉模型，也不做画面理解**：
+
+- 语音识别的输入只有 `ffmpeg` 抽取的 **16 kHz 单声道音频**，不读取视频帧，不做 OCR、场景识别或镜头分析。
+- 强制对齐的输入是同一段音频 + 已有字幕文本，同样不涉及画面。
+- 预览与导出是确定性的浏览器渲染（Remotion + Chromium），逐帧绘制 HTML/CSS，不做生成式推理。
+- worker 以纯 CPU 模式启动（`VK_ICD_FILENAMES=none`、`GGML_VULKAN=0`），不需要 GPU 或视觉模型运行时。
+- 运行时不调用云端 API；唯一的外部下载是首次导出时获取 Remotion Chromium，可提前预下载（见[部署说明](#7-预下载-chromium离线内网部署建议)）。
+
+因此字幕结果只取决于音频与文本，不会因画面内容不同而产生差异。识别与对齐能力来自 [HaujetZhao/Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF)（模型为 Qwen3-ASR / Qwen3-ForcedAligner），其运行目录结构见[部署说明](#lib-放置结构)。
