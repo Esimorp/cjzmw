@@ -8,7 +8,7 @@ Express 5 + React 19 SSR skeleton built on Vite, with Remotion pinned for video 
 - **React 19** — `renderToString` on the server, `hydrateRoot` on the client
 - **Vite 8** — dev middleware, `transformIndexHtml`, `ssrLoadModule`, client + SSR builds
 - **tsx** — runs and watches `server.ts` in development (dev dependency)
-- **Remotion 4.0.536** — pinned (`remotion`, `@remotion/player`, `@remotion/cli`)
+- **Remotion 4.0.536** — pinned (`remotion`, `@remotion/player`, `@remotion/cli`, `@remotion/fonts`, plus `@remotion/bundler` + `@remotion/renderer` for MP4 export)
 
 ## Scripts
 
@@ -30,7 +30,10 @@ Express 5 + React 19 SSR skeleton built on Vite, with Remotion pinned for video 
 - `FFMPEG_PATH` — **optional**. Absolute path to the `ffmpeg` binary used to extract 16 kHz mono PCM audio for speech recognition. When unset, `ffmpeg` is resolved from `PATH`; if it is missing, jobs fail with `503 FFMPEG_UNAVAILABLE`.
 - `QWEN_ASR_DIR` — **optional**. Runtime directory containing the `model/` and `qwen_asr_gguf/` sources/deps. Defaults to `lib/qwen`. The whole directory is git-ignored and must be copied in manually. The frozen `transcribe.exe` inside it is **not** used.
 - `QWEN_PYTHON` — **optional**. Absolute path to the worker interpreter. Defaults to `.venv\Scripts\python.exe` in the repository; see [`python/SETUP.md`](python/SETUP.md).
-- `WORKSPACE_DIR` — **optional**. Directory for the persistent workspace (`workspace.json` + `videos/`). Defaults to `./storage/workspace` (git-ignored).
+- `WORKSPACE_DIR` — **optional**. Directory for the persistent workspace (`workspace.json`). Defaults to `./storage/workspace` (git-ignored).
+- `PUBLIC_DIR` — **optional**. Static root that serves uploads and fonts. Defaults to `./public`; videos are stored in and served from `<PUBLIC_DIR>/videos` (git-ignored). Used by tests to isolate the static root instead of touching the real `public/`.
+- `EXPORT_DIR` — **optional**. Directory for rendered MP4s. Defaults to `./storage/exports` (git-ignored).
+- `REMOTION_LOG_LEVEL` — **optional**. Verbosity of Remotion's own renderer logs on the server console: `trace`, `verbose` (default), `info`, `warn` or `error`. Invalid values fall back to `verbose`.
 
 ## Media API
 
@@ -38,10 +41,10 @@ The media router (`media-server.ts`) is mounted at `/api` **before** Vite middle
 
 | Route | Description |
 | --- | --- |
-| `POST /api/videos` | Accepts one file in the `video` multipart field (max **2 GB**, one file per request), probes it with `ffprobe`, stores it in a per-process temp directory, and returns the video metadata as JSON (`201`). |
-| `GET /api/videos/:id/content` | Streams the stored video with the probed content type and HTTP range support (`206`); an unsatisfiable range returns `416`. |
-| `HEAD /api/videos/:id/content` | Same as above but headers only. |
-| `DELETE /api/videos/:id` | Deletes the temp file and metadata, returning `204`. |
+| `POST /api/videos` | Accepts one file in the `video` multipart field (max **2 GB**, one file per request), probes it with `ffprobe`, then copies it to `public/videos/<id>.<ext>` and returns the video metadata as JSON (`201`). |
+| `DELETE /api/videos/:id` | Deletes the stored file and metadata, returning `204`. |
+
+**Video bytes are served as plain static files**, not through a dedicated API proxy: the browser, the Remotion player and the export bundle all load `/videos/<id>.<ext>` from the `public` root (`express.static` in production, Vite's `publicDir` middleware in development), which supports `GET`, `HEAD` and HTTP `Range` (`206` / `416`).
 
 Responses use a localized JSON error shape (`{ error, code }`):
 
@@ -57,7 +60,7 @@ Metadata returned by `POST /api/videos`:
 ```ts
 interface VideoMetadata {
   id: string // UUID
-  url: string // /api/videos/:id/content
+  url: string // /videos/<id>.<ext> (server-derived static path)
   filename: string // sanitized original filename
   size: number // bytes
   duration: number // seconds
@@ -79,19 +82,20 @@ Notes:
 The app keeps exactly **one** resumable workspace on disk:
 
 - Location: `WORKSPACE_DIR`, default `./storage/workspace` (git-ignored).
-- `workspace.json` — `revision`, the current video metadata, the video filename, all subtitle segments/tokens/`units` with timings, and `updatedAt`. Written atomically (temp file + rename) and serialized so writes never interleave.
-- `videos/<id>.<ext>` — the video bytes. The JSON **never** embeds the video; playback still goes through the `/api/videos/:id/content` proxy with Range support.
+- `workspace.json` — `revision`, the current video metadata (including `url` and `publicPath`), the video filename, all subtitle segments/tokens/`units` with timings, and `updatedAt`. Written atomically (temp file + rename) and serialized so writes never interleave.
+- `public/videos/<id>.<ext>` — the video bytes (git-ignored). The JSON **never** embeds the video; playback, the player and the export bundle all load it as the static file `/videos/<id>.<ext>`.
 
 Behaviour:
 
 - **Restore on load.** `GET /api/workspace` returns the saved document; the client applies it once before enabling autosave, so the built-in sample/empty state can never overwrite the disk copy.
 - **Autosave.** TXT import, edits, deletes, merges, and completed ASR/align jobs schedule a debounced (600 ms) `PUT /api/workspace` carrying the revision they were based on.
-- **Uploads.** A new video is only adopted after the server has copied the file and durably written the JSON (subtitles reset to empty). Any upload/probe/write failure leaves the previous workspace untouched. The old video file is removed only after the new document is durable.
+- **Uploads.** A new video is only adopted after the server has copied the file into `public/videos` and durably written the JSON (subtitles reset to empty). Any upload/probe/write failure leaves the previous workspace untouched. The old video file is removed only after the new document is durable.
+- **Migration from older workspaces.** Documents written before the `public/videos` move referenced `videos/<name>` inside the workspace directory and the `/api/videos/:id/content` URL. On startup such a file is **copied** (never moved) into `public/videos`, the copy is size-checked, the JSON is rewritten, and only then is the legacy file removed. If anything fails the original JSON and file stay exactly as they were, so no subtitles or video data are lost. Existing subtitles are never reset by this migration.
 - **Conflicts.** A stale revision returns `409 WORKSPACE_CONFLICT` (shown in the UI) instead of silently overwriting; saving can never swap the video identity.
 - **Corruption.** If `workspace.json` cannot be parsed it is left byte-for-byte untouched, the API reports `corrupt: true` / `writable: false`, and all writes return `409 WORKSPACE_CORRUPT`.
 - **Leaving the page never deletes anything**; pending edits are flushed instead.
 - **Not restored:** running ASR/align jobs, open editors/popups and drafts. Only saved data comes back.
-- **Paths** are validated: only a bare filename is stored, and the resolved file must stay inside `videos/`.
+- **Paths** are validated: only a bare filename is stored, and the resolved file must stay inside `public/videos/`; `publicPath` must be exactly `videos/<name>` with no traversal.
 
 The app is always served from the root path (`/`); there is no configurable base path.
 
@@ -152,6 +156,21 @@ Behaviour notes:
 - **Shutdown.** `SIGINT`/`SIGTERM` stop ASR jobs (killing their process trees) and close idle connections so shutdown does not wait for a long transcription; ASR jobs are cleaned up before the media temp directory.
 - `src/subtitle-timing.ts` (pure, shared with the client) expands each raw ASR item into per-code-point timings, splits SRT/transcript text into word tokens with `Intl.Segmenter`, and maps tokens onto the ordered raw characters. A token matching one whole raw item keeps the model bounds (`timingSource: 'model'`); fragments and recombinations get interpolated bounds (`'interpolated'`); unmatched text stays `null` / `'unmatched'` and is never extrapolated. Each timed token also carries `units: { char, start, end }[]` so later split/merge edits can remap timings. Example: raw `字幕工具 [1,2]` maps to `字幕 [1,1.5]` and `工具 [1.5,2]`.
 
+## MP4 export API
+
+The export router (`export-server.ts`) renders the same Remotion composition the player shows (`src/VideoStage.tsx`) to an MP4 with `@remotion/bundler` + `@remotion/renderer`. The bundle is built once and cached per video, and the videos are served from the app's `public/videos` directory, so the render page reads them same-origin. One export runs at a time, and a running export pins its video (`DELETE /api/videos/:id` → `409 VIDEO_BUSY`).
+
+Rendering always uses **Remotion's own Chromium** (`chromeMode: 'chrome-for-testing'`), downloaded by `ensureBrowser` on the first export and reused afterwards — the system Chrome/Edge is never launched. Remotion's renderer logs (bundle, browser download, composition, frame progress) are written to the server console with an `[export <id>]` prefix; set `REMOTION_LOG_LEVEL` to change the verbosity.
+
+| Route | Description |
+| --- | --- |
+| `POST /api/export` | Queues a render of the current video with the posted subtitles (`{ segments, styles }`) and returns `202 { id, status, progress, message, filename, downloadUrl }`. `409 NO_VIDEO` without a video, `409 EXPORT_BUSY` while another render runs, `400 NO_SUBTITLES` for an empty subtitle list. |
+| `GET /api/export/:id` | Job status (`preparing` \| `rendering` \| `completed` \| `failed` \| `cancelled`) plus `0`-`1` progress and the last message. |
+| `GET /api/export/:id/file` | Downloads the finished MP4 (`Content-Disposition: attachment`). |
+| `DELETE /api/export/:id` | Cancels a running render (Remotion cancel signal) and removes its output file. |
+
+Rendering is server-side, so the exported file includes the source audio and is independent of the browser's WebCodecs support. The client polls every 800 ms, shows a progress bar with a cancel button, and triggers the download when the job completes. On `SIGINT`/`SIGTERM`, running exports are cancelled and `storage/exports` is removed.
+
 ## How SSR works
 
 `index.html` is the single template and contains two placeholders:
@@ -174,6 +193,11 @@ index.html               # SSR template with app-head / app-html placeholders
 server.ts                # Express 5 + node:http server (dev middleware + prod static/SSR)
 media-server.ts          # /api media router: upload, probe, range streaming, delete
 asr-server.ts            # /api ASR router: FFmpeg audio extraction + Qwen ASR jobs
+export-server.ts         # /api export router: Remotion bundling + MP4 render jobs
+src/VideoStage.tsx       # Remotion composition (video + burn-in subtitles), shared by player and export
+src/remotion-entry.tsx   # registerRoot entry bundled by @remotion/bundler
+src/remotion-root.tsx    # Composition registry + calculateMetadata for the exporter
+src/export-client.ts     # Client helpers for the export job API
 src/video-types.ts       # Shared VideoMetadata type
 src/subtitle-types.ts    # Shared SubtitleToken / SubtitleSegment types
 src/subtitle-timing.ts   # Shared raw-ASR -> token timestamp mapping (pure)

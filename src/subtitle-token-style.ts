@@ -4,8 +4,9 @@ import { createContext, useContext } from 'react'
  * A registered token style: CSS class names only, never inline values.
  *
  * The classes are the single source of truth for font size, colour and
- * margins — they are defined in `App.css`. A token references a style by its
- * `styleName`; tokens without one fall back to {@link DEFAULT_SUBTITLE_TOKEN_STYLE_NAME}.
+ * margins — they are defined in `subtitles.css`. A token references a style by
+ * its `styleName`; tokens without one fall back to
+ * {@link DEFAULT_SUBTITLE_TOKEN_STYLE_NAME}.
  */
 export interface SubtitleTokenStyle {
   className: string
@@ -15,11 +16,50 @@ export interface SubtitleTokenStyle {
 /** Name of the built-in style that cannot be unregistered. */
 export const DEFAULT_SUBTITLE_TOKEN_STYLE_NAME = 'default'
 
-/** CSS classes defined in App.css: base chip look plus the focused variant. */
+/** CSS classes defined in subtitles.css: base chip look plus the focused variant. */
 export const DEFAULT_SUBTITLE_TOKEN_STYLE: SubtitleTokenStyle = Object.freeze({
   className: 'token-chip--default',
   focusedClassName: 'token-chip--default-focused',
 })
+
+/** Name of the built-in emphasis style (`重点`). */
+export const EMPHASIS_SUBTITLE_TOKEN_STYLE_NAME = 'emphasis'
+
+/** Emphasis classes: bigger and heavier, with a louder focused variant. */
+export const EMPHASIS_SUBTITLE_TOKEN_STYLE: SubtitleTokenStyle = Object.freeze({
+  className: 'token-chip--emphasis',
+  focusedClassName: 'token-chip--emphasis-focused',
+})
+
+/**
+ * Built-in styles every registry starts with.
+ *
+ * They are registered by the provider itself (and re-seeded into the Remotion
+ * bridge through its `initialStyles` snapshot), so no consumer has to register
+ * them and an exported video always resolves the same names.
+ */
+export const BUILT_IN_SUBTITLE_TOKEN_STYLES: Readonly<
+  Record<string, SubtitleTokenStyle>
+> = Object.freeze({
+  [DEFAULT_SUBTITLE_TOKEN_STYLE_NAME]: DEFAULT_SUBTITLE_TOKEN_STYLE,
+  [EMPHASIS_SUBTITLE_TOKEN_STYLE_NAME]: EMPHASIS_SUBTITLE_TOKEN_STYLE,
+})
+
+/** Display labels for the built-in styles; custom names are shown verbatim. */
+const BUILT_IN_STYLE_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  [DEFAULT_SUBTITLE_TOKEN_STYLE_NAME]: '默认样式',
+  [EMPHASIS_SUBTITLE_TOKEN_STYLE_NAME]: '重点',
+})
+
+/** Human-readable label for a registered style name (used by the picker). */
+export function subtitleTokenStyleLabel(styleName: string): string {
+  return BUILT_IN_STYLE_LABELS[styleName] ?? styleName
+}
+
+/** True for styles the registry owns and must never drop. */
+export function isBuiltInSubtitleTokenStyle(styleName: string): boolean {
+  return Object.prototype.hasOwnProperty.call(BUILT_IN_SUBTITLE_TOKEN_STYLES, styleName)
+}
 
 /** Style registry plus stable register/unregister callbacks. */
 export interface SubtitleTokenStyleContextValue {
@@ -69,7 +109,7 @@ export function sanitizeStyleName(value: unknown): string | null {
 const fallbackGetStyle = (): SubtitleTokenStyle => DEFAULT_SUBTITLE_TOKEN_STYLE
 
 export const SubtitleTokenStyleContext = createContext<SubtitleTokenStyleContextValue>({
-  styles: Object.freeze({ [DEFAULT_SUBTITLE_TOKEN_STYLE_NAME]: DEFAULT_SUBTITLE_TOKEN_STYLE }),
+  styles: BUILT_IN_SUBTITLE_TOKEN_STYLES,
   // Outside a provider these are intentional no-ops rather than crashes.
   registerStyle: () => undefined,
   unregisterStyle: () => undefined,

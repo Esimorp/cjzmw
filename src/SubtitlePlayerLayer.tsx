@@ -1,5 +1,4 @@
 import { Fragment } from 'react'
-import { AbsoluteFill } from 'remotion'
 import { useActiveSubtitles } from './useActiveSubtitles'
 import { isLineBreakToken } from './subtitle-linebreak'
 
@@ -26,7 +25,7 @@ export function SubtitlePlayerLayer() {
   if (playbackSegments.length === 0) return null
 
   return (
-    <AbsoluteFill className="player-caption-layer">
+    <div className="player-caption-layer">
       {playbackSegments.map(({ segment, tokens }) => (
         <div
           key={segment.id}
@@ -57,6 +56,6 @@ export function SubtitlePlayerLayer() {
           ))}
         </div>
       ))}
-    </AbsoluteFill>
+    </div>
   )
 }

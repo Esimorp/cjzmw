@@ -1,80 +1,51 @@
-import { useState, type CSSProperties } from 'react'
-import { Player } from '@remotion/player'
-import { AbsoluteFill, Html5Video } from 'remotion'
-import { SubtitleProvider } from './SubtitleProvider'
+import {
+  forwardRef,
+  useImperativeHandle,
+  useRef,
+  useState,
+  type CSSProperties,
+} from 'react'
+import { Player, type PlayerRef } from '@remotion/player'
+import { resolveCompositionSize } from './composition'
 import { useSubtitles } from './SubtitleContext'
-import { SubtitlePlayerLayer } from './SubtitlePlayerLayer'
-import { SubtitleTokenStyleProvider } from './SubtitleTokenStyleProvider'
-import { useSubtitleTokenStyle, type SubtitleTokenStyle } from './subtitle-token-style'
-import type { SubtitleSegment } from './subtitle-types'
+import { useSubtitleTokenStyle } from './subtitle-token-style'
+import { VideoStage } from './VideoStage'
 import type { VideoMetadata } from './video-types'
 
-/**
- * Remotion's `<Player>` renders its `component` inside its own React tree, so
- * the app-level contexts are not inherited. The player therefore receives
- * read-only snapshots through `inputProps` (`segments` and the registered
- * `styles`) and `VideoStage` re-provides both contexts — a bridge, not a second
- * editable copy: nothing in the composition writes back and no component here
- * calls `setSegments` or `registerStyle`.
- *
- * Passing `styles` is required: the composition must resolve the same registry
- * entries as the editor, including custom registrations, instead of silently
- * falling back to only the built-in default.
- */
-function VideoStageBody({
-  video,
-  onPlaybackError,
-}: {
-  video: VideoMetadata
-  onPlaybackError: (message: string) => void
-}) {
-  return (
-    <Html5Video
-      src={video.url}
-      style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-      onError={() => onPlaybackError('视频播放失败，请重新选择文件后再试')}
-    />
-  )
+export interface VideoPreviewHandle {
+  /**
+   * Jump the player to an absolute time in seconds (clamped to the video).
+   * `pause` stops playback first so the target frame can be inspected.
+   */
+  seekToSeconds: (seconds: number, options?: { pause?: boolean }) => void
 }
 
-export function VideoStage({
-  video,
-  segments,
-  styles,
-  onPlaybackError,
-}: {
-  video: VideoMetadata
-  /** Read-only snapshot bridged from the app-level SubtitleContext. */
-  segments: SubtitleSegment[]
-  /** Read-only snapshot of the app-level token style registry. */
-  styles?: Record<string, SubtitleTokenStyle>
-  onPlaybackError: (message: string) => void
-}) {
-  return (
-    <AbsoluteFill
-      style={{ backgroundColor: '#000', justifyContent: 'center' }}
-    >
-      <SubtitleTokenStyleProvider initialStyles={styles}>
-        <SubtitleProvider initialSegments={segments}>
-          <VideoStageBody video={video} onPlaybackError={onPlaybackError} />
-          <SubtitlePlayerLayer />
-        </SubtitleProvider>
-      </SubtitleTokenStyleProvider>
-    </AbsoluteFill>
-  )
-}
-
-export function VideoPreview({ video }: { video: VideoMetadata }) {
+/** Remotion player for the current video; exposes seeking to the editor. */
+export const VideoPreview = forwardRef<
+  VideoPreviewHandle,
+  { video: VideoMetadata }
+>(function VideoPreview({ video }, ref) {
   const [error, setError] = useState<string | null>(null)
   const { segments } = useSubtitles()
   const { styles } = useSubtitleTokenStyle()
+  const playerRef = useRef<PlayerRef>(null)
 
-  const fps = video.fps
-  const width = Math.max(1, Math.round(video.width) || 1)
-  const height = Math.max(1, Math.round(video.height) || 1)
-  const durationInFrames = Math.max(
-    1,
-    Math.ceil((video.duration > 0 ? video.duration : 0) * fps),
+  const { width, height, fps, durationInFrames } = resolveCompositionSize(video)
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      seekToSeconds(seconds: number, options?: { pause?: boolean }) {
+        const player = playerRef.current
+        if (!player || !Number.isFinite(seconds)) return
+        if (options?.pause) player.pause()
+        // Ceil so the frame lands at or after the requested time; rounding
+        // could seek to the frame just before a segment starts.
+        const frame = Math.ceil(Math.max(0, seconds) * fps)
+        player.seekTo(Math.min(frame, durationInFrames - 1))
+      },
+    }),
+    [fps, durationInFrames],
   )
 
   return (
@@ -89,6 +60,7 @@ export function VideoPreview({ video }: { video: VideoMetadata }) {
       >
         <Player
           key={video.id}
+          ref={playerRef}
           component={VideoStage}
           inputProps={{
             video,
@@ -116,4 +88,4 @@ export function VideoPreview({ video }: { video: VideoMetadata }) {
       ) : null}
     </div>
   )
-}
+})

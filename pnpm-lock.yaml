@@ -8,7 +8,19 @@ importers:
 
   .:
     dependencies:
+      '@remotion/bundler':
+        specifier: 4.0.536
+        version: 4.0.536(postcss@8.5.30)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
+      '@remotion/fonts':
+        specifier: 4.0.536
+        version: 4.0.536(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
+      '@remotion/media':
+        specifier: 4.0.536
+        version: 4.0.536(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       '@remotion/player':
+        specifier: 4.0.536
+        version: 4.0.536(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
+      '@remotion/renderer':
         specifier: 4.0.536
         version: 4.0.536(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       express:
@@ -552,6 +564,9 @@ packages:
 
   '@remotion/elevenlabs@4.0.536':
     resolution: {integrity: sha512-Anj3etnBHjGw88pCxiMDPm6ZzKU9Zcnc83wPq2zbC5s2vGTOy7zd/N3eVxHmDctC32rV1wQyHisOaImEPh6EJg==}
+
+  '@remotion/fonts@4.0.536':
+    resolution: {integrity: sha512-red61dzjsMXqCqALLI4g+4Gwcg3mSIfij6LkZSSC4UVhHpkX4Ci1NvGt8gvqM3eSiEXVaozut7MeC/D9uIJAbw==}
 
   '@remotion/licensing@4.0.536':
     resolution: {integrity: sha512-ZNf4gnH0N5V427Onom8/0sura0+aoJxiIzprDfTmDqYh0/X7y4ua076tnxPwsH9EBkIzwWegaOIdfSZGRzpSAA==}
@@ -2546,6 +2561,13 @@ snapshots:
     dependencies:
       '@remotion/captions': 4.0.536
       zod: 4.5.4
+
+  '@remotion/fonts@4.0.536(react-dom@19.3.1(react@19.3.1))(react@19.3.1)':
+    dependencies:
+      remotion: 4.0.536(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
+    transitivePeerDependencies:
+      - react
+      - react-dom
 
   '@remotion/licensing@4.0.536': {}
 

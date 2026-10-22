@@ -62,7 +62,7 @@ interface WorkspaceHooks {
     tempPath: string
     contentType: string
     baseRevision: number
-  }) => Promise<{ document: unknown }>
+  }) => Promise<{ document: { video?: VideoMetadata | null } }>
   revision: () => number
 }
 
@@ -374,7 +374,10 @@ export async function createMediaService(
       const id = randomUUID()
       const metadata: VideoMetadata = {
         id,
-        url: `/api/videos/${id}/content`,
+        // Placeholder: the workspace derives the real static URL from the
+        // persisted file name (`/videos/<id><ext>`) and never trusts a client
+        // supplied path.
+        url: '',
         filename: originalName,
         size,
         duration,
@@ -410,13 +413,17 @@ export async function createMediaService(
 
       // Persistence first: the workspace switch must be durable before the old
       // video/subtitles are replaced. Any failure keeps the old workspace.
+      let committed: VideoMetadata
       try {
-        await hooks.commitUpload({
+        const result = await hooks.commitUpload({
           metadata,
           tempPath: filePath,
           contentType,
           baseRevision: hooks.revision(),
         })
+        // The committed document carries the server-derived static URL/path;
+        // the client never supplies either.
+        committed = result.document.video ?? metadata
       } catch (error) {
         await removeTempFile(filePath)
         const commitError = error as ExpressError & { code?: string }
@@ -442,83 +449,14 @@ export async function createMediaService(
         return
       }
 
-      // The workspace already copied the file; drop the temporary upload.
+      // The workspace already copied the file into public/videos; drop the
+      // temporary upload.
       await removeTempFile(filePath)
       videos.clear()
-      videos.set(id, { metadata, filePath: filePath, contentType })
-      res.status(201).json(metadata)
+      videos.set(id, { metadata: committed, filePath: filePath, contentType })
+      res.status(201).json(committed)
     },
   )
-
-  router.get('/videos/:id/content', (req: Request, res: Response) => {
-    const id = getRouteId(req)
-    const record = getRecord(id)
-    if (!record) {
-      res.status(404).json({ error: '未找到该视频。', code: 'NOT_FOUND' })
-      return
-    }
-
-    // Send via `root` + basename: an absolute path is resolved differently by
-    // send under a non-ASCII working directory and 404s. The resolved path is
-    // never exposed in the response.
-    res.type(record.contentType)
-
-    res.sendFile(path.basename(record.filePath), { root: path.dirname(record.filePath), acceptRanges: true }, (error?: Error) => {
-      if (!error) return
-      const streamError = error as ExpressError
-      console.error('Video stream failed:', streamError.status, streamError.code, streamError.message)
-
-      if (res.headersSent) {
-        res.destroy(streamError)
-        return
-      }
-
-      const status = streamError.status ?? streamError.statusCode
-      if (status === 416 || streamError.code === 'EINVAL' || streamError.code === 'ERANGE') {
-        const contentRange = res.getHeader('Content-Range')
-        if (typeof contentRange === 'string' && contentRange !== '') {
-          res.setHeader('Content-Range', contentRange)
-        }
-        res.status(416).end()
-        return
-      }
-
-      if (streamError.code === 'ENOENT') {
-        res.status(404).json({ error: '未找到该视频。', code: 'NOT_FOUND' })
-        return
-      }
-
-      res.status(500).json({ error: '读取视频失败。', code: 'READ_FAILED' })
-    })
-  })
-
-  router.head('/videos/:id/content', (req: Request, res: Response) => {
-    const id = getRouteId(req)
-    const record = getRecord(id)
-    if (!record) {
-      res.status(404).json({ error: '未找到该视频。', code: 'NOT_FOUND' })
-      return
-    }
-
-    res.type(record.contentType)
-
-    res.sendFile(path.basename(record.filePath), { root: path.dirname(record.filePath), acceptRanges: true }, (error?: Error) => {
-      if (!error) return
-      const streamError = error as ExpressError
-
-      if (res.headersSent) {
-        res.destroy(streamError)
-        return
-      }
-
-      if (streamError.code === 'ENOENT') {
-        res.status(404).json({ error: '未找到该视频。', code: 'NOT_FOUND' })
-        return
-      }
-
-      res.status(500).json({ error: '读取视频失败。', code: 'READ_FAILED' })
-    })
-  })
 
   router.delete('/videos/:id', async (req: Request, res: Response) => {
     const id = getRouteId(req)

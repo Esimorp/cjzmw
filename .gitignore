@@ -12,6 +12,14 @@ dist
 dist-ssr
 *.local
 
+# Large font binaries in public/ are supplied locally, never committed.
+public/**/*.ttf
+public/**/*.ttc
+public/**/*.otf
+public/**/*.woff
+public/**/*.woff2
+public/**/*.eot
+
 # Bundled Qwen ASR runtime (binaries, models, Python env) — never committed.
 lib/qwen/
 
@@ -27,6 +35,9 @@ __pycache__/
 
 # Persistent workspace (saved video + subtitle JSON); configurable via WORKSPACE_DIR.
 storage/
+
+# Uploaded videos are served as static files from public/videos (never committed).
+public/videos/
 
 # Editor directories and files
 .vscode/*

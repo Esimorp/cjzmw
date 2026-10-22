@@ -166,6 +166,7 @@
   padding: 9px 12px;
   border: 1px solid transparent;
   border-radius: 12px;
+  cursor: pointer;
   transition:
     background-color 0.15s ease,
     border-color 0.15s ease;
@@ -472,7 +473,8 @@
 }
 
 .panel .stage-status,
-.panel .stage-error {
+.panel .stage-error,
+.panel .stage-warning {
   flex: none;
   word-break: break-word;
 }
@@ -481,6 +483,49 @@
   color: #8f2f1c;
   background: rgba(180, 68, 47, 0.1);
   border: 1px solid rgba(180, 68, 47, 0.32);
+}
+
+/* Advisory: subtitle text changed since the last forced alignment. */
+.stage-warning {
+  margin: 0;
+  padding: 9px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #7a5a12;
+  background: rgba(196, 148, 30, 0.12);
+  border: 1px solid rgba(196, 148, 30, 0.35);
+}
+
+/* Browser-side Remotion export: text, progress bar and cancel in one row. */
+.export-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.export-progress {
+  flex: 1 1 120px;
+  max-width: 260px;
+  height: 6px;
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(91, 127, 109, 0.18);
+}
+
+.export-progress::-webkit-progress-bar {
+  background: rgba(91, 127, 109, 0.18);
+}
+
+.export-progress::-webkit-progress-value {
+  background: var(--calm-accent);
+}
+
+.export-progress::-moz-progress-bar {
+  background: var(--calm-accent);
 }
 
 .stage-empty {

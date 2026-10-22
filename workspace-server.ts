@@ -28,9 +28,11 @@ interface StoredWorkspace {
 
 export interface WorkspaceService {
   router: Router
-  /** Directory holding the workspace JSON and the persisted video file. */
+  /** Directory holding the workspace JSON. */
   readonly dir: string
-  /** Resolve the persisted video file, validating it stays inside `dir`. */
+  /** Static root that serves the video files (the app's `public` directory). */
+  readonly publicDir: string
+  /** Resolve the persisted video file, validating it stays inside `publicDir/videos`. */
   resolveVideoFile: (videoId: string) => string | undefined
   /** Persist a newly uploaded video and reset the subtitle segments. */
   commitUpload: (input: {
@@ -98,6 +100,9 @@ function validateVideoMetadata(value: unknown): VideoMetadata | null {
   return {
     id: video.id,
     url: video.url,
+    ...(typeof video.publicPath === 'string' && video.publicPath !== ''
+      ? { publicPath: video.publicPath }
+      : {}),
     filename: video.filename,
     size: video.size,
     duration: video.duration,
@@ -216,10 +221,35 @@ function assertSafeBasename(name: string): string {
   return name
 }
 
+/**
+ * Validate a path relative to the static `public` root: it must stay inside
+ * `videos/`, contain no separators beyond that prefix and no traversal parts.
+ */
+function assertSafePublicPath(publicPath: string): string {
+  const normalized = publicPath.replace(/\\/g, '/')
+  if (normalized.length > 256 || normalized.startsWith('/')) {
+    throw new WorkspaceError(400, 'INVALID_WORKSPACE', '工作区视频路径无效。')
+  }
+  const parts = normalized.split('/')
+  if (parts.length !== 2 || parts[0] !== PUBLIC_VIDEOS_DIR) {
+    throw new WorkspaceError(400, 'INVALID_WORKSPACE', '工作区视频路径无效。')
+  }
+  assertSafeBasename(parts[1])
+  return `${PUBLIC_VIDEOS_DIR}/${parts[1]}`
+}
+
 export interface WorkspaceServiceOptions {
   /** Root directory; defaults to `WORKSPACE_DIR` or `<repo>/storage/workspace`. */
   dir?: string
+  /**
+   * Static root that serves video files; defaults to `PUBLIC_DIR` or
+   * `<repo>/public`. Videos are stored under `<publicDir>/videos/`.
+   */
+  publicDir?: string
 }
+
+/** Directory (relative to the public root) holding the persisted videos. */
+const PUBLIC_VIDEOS_DIR = 'videos'
 
 export async function createWorkspaceService(
   options: WorkspaceServiceOptions = {},
@@ -228,11 +258,79 @@ export async function createWorkspaceService(
     options.dir ?? process.env.WORKSPACE_DIR ?? path.join(process.cwd(), 'storage', 'workspace'),
   )
   const documentPath = path.join(dir, 'workspace.json')
-  const videosDir = path.join(dir, 'videos')
+  const publicDir = path.resolve(
+    options.publicDir ?? process.env.PUBLIC_DIR ?? path.join(process.cwd(), 'public'),
+  )
+  /** Static root for videos; the browser loads them as `/videos/<name>`. */
+  const videosDir = path.join(publicDir, PUBLIC_VIDEOS_DIR)
+  /** Legacy location: videos used to live next to the workspace JSON. */
+  const legacyVideosDir = path.join(dir, 'videos')
   await fs.mkdir(videosDir, { recursive: true })
 
   let current: StoredWorkspace = { document: emptyDocument(), corrupt: false }
   let writeChain: Promise<void> = Promise.resolve()
+
+  /**
+   * Move a pre-`public/videos` workspace forward.
+   *
+   * Old documents referenced `videos/<name>` inside the workspace directory and
+   * used the `/api/videos/<id>/content` proxy URL. When such a file is still
+   * present it is **copied** (not moved) into `<public>/videos`, the JSON is
+   * rewritten only after the copy is verified, and the legacy file is removed
+   * last. Any failure leaves the original document and file untouched, so a
+   * broken migration can never delete or blank existing data.
+   */
+  async function migrateLegacyVideo(document: WorkspaceDocument): Promise<WorkspaceDocument> {
+    if (!document.video || !document.videoFile) return document
+    if (document.video.publicPath) return document
+
+    const legacyPath = path.join(legacyVideosDir, document.videoFile)
+    const target = path.join(videosDir, document.videoFile)
+    const publicPath = `${PUBLIC_VIDEOS_DIR}/${document.videoFile}`
+
+    let targetReady = true
+    try {
+      const legacyStat = await fs.stat(legacyPath)
+      targetReady = false
+      await fs.copyFile(legacyPath, target)
+      const copied = await fs.stat(target)
+      if (!copied.isFile() || copied.size !== legacyStat.size) {
+        throw new Error('copied video size mismatch')
+      }
+      targetReady = true
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'ENOENT') {
+        // Leave the document and the legacy file exactly as they were.
+        console.error('Workspace video migration failed:', error)
+        return document
+      }
+      // No legacy file: fall back to an existing public copy if one is there.
+      targetReady = await fileExists(target)
+    }
+
+    const migrated: WorkspaceDocument = {
+      ...document,
+      video: {
+        ...document.video,
+        publicPath,
+        url: `/${publicPath}`,
+      },
+    }
+    if (!targetReady) {
+      // Point at the static path anyway; the missing-file check reports it and
+      // the legacy file (if any) is left in place.
+      return migrated
+    }
+    try {
+      await persist(migrated)
+    } catch (error) {
+      console.error('Workspace video migration could not be persisted:', error)
+      return document
+    }
+    await fs.rm(legacyPath, { force: true }).catch(() => undefined)
+    return migrated
+  }
 
   /** Read the document, quarantining (not deleting) a corrupt file. */
   async function load(): Promise<StoredWorkspace> {
@@ -251,10 +349,14 @@ export async function createWorkspaceService(
       const segments = validateSegments(parsed.segments ?? [])
       const videoFile =
         typeof parsed.videoFile === 'string' ? assertSafeBasename(parsed.videoFile) : null
+      const publicPath =
+        typeof parsed.video?.publicPath === 'string' && parsed.video.publicPath !== ''
+          ? assertSafePublicPath(parsed.video.publicPath)
+          : undefined
       return {
         document: {
           revision: isFiniteNumber(parsed.revision) ? parsed.revision : 0,
-          video,
+          video: video ? (publicPath ? { ...video, publicPath } : video) : null,
           videoFile: video ? videoFile : null,
           segments,
           updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : '',
@@ -297,6 +399,9 @@ export async function createWorkspaceService(
   }
 
   current = await load()
+  if (!current.corrupt) {
+    current = { document: await migrateLegacyVideo(current.document), corrupt: false }
+  }
 
   /** Resolve a persisted video file, guaranteeing it lives under `videos/`. */
   function resolveVideoFile(videoId: string): string | undefined {
@@ -449,7 +554,9 @@ export async function createWorkspaceService(
     const reservedRevision = current.document.revision
 
     const fileName = `${input.metadata.id}${path.extname(input.metadata.filename).slice(0, 10)}`
-    const target = path.join(videosDir, assertSafeBasename(fileName))
+    const safeName = assertSafeBasename(fileName)
+    const target = path.join(videosDir, safeName)
+    const publicPath = `${PUBLIC_VIDEOS_DIR}/${safeName}`
 
     try {
       // Copy (never move) so the temp file can still be reconciled on failure.
@@ -457,15 +564,16 @@ export async function createWorkspaceService(
 
       const next: WorkspaceDocument = {
         revision: reservedRevision,
-        video: input.metadata,
-        videoFile: path.basename(target),
+        // The URL is always server-derived: client-supplied paths are ignored.
+        video: { ...input.metadata, url: `/${publicPath}`, publicPath },
+        videoFile: safeName,
         segments: [],
         updatedAt: new Date().toISOString(),
       }
       await enqueueWrite(() => persist(next))
       current = { ...current, document: next }
       // Only after the new document is durable may the old file be removed.
-      if (previousFile && previousFile !== path.basename(target)) {
+      if (previousFile && previousFile !== safeName) {
         const previousPath = path.resolve(videosDir, previousFile)
         if (previousPath.startsWith(path.resolve(videosDir) + path.sep)) {
           await fs.rm(previousPath, { force: true, maxRetries: 5, retryDelay: 100 }).catch(() => undefined)
@@ -509,5 +617,5 @@ export async function createWorkspaceService(
     })
   }
 
-  return { router, dir, resolveVideoFile, commitUpload, get, revision, cleanup }
+  return { router, dir, publicDir, resolveVideoFile, commitUpload, get, revision, cleanup }
 }

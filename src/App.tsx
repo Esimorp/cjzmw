@@ -9,11 +9,21 @@ import {
 } from 'react'
 import './subtitles.css'
 import './App.css'
-import { VideoPreview } from './VideoPreview'
+import { VideoPreview, type VideoPreviewHandle } from './VideoPreview'
+import {
+  ExportRequestError,
+  cancelExportJob,
+  createExportJob,
+  downloadExportFile,
+  fetchExportJob,
+  type ExportJob,
+} from './export-client'
 import { useSubtitles } from './SubtitleContext'
 import { legacyToken } from './subtitle-sample'
 import {
+  BUILT_IN_SUBTITLE_TOKEN_STYLES,
   DEFAULT_SUBTITLE_TOKEN_STYLE_NAME,
+  subtitleTokenStyleLabel,
   useSubtitleTokenStyle,
 } from './subtitle-token-style'
 import {
@@ -133,6 +143,26 @@ function segmentTimingLabel(segment: Segment): string {
   return `${formatSeconds(start)}s – ${formatSeconds(end)}s`
 }
 
+/**
+ * Text-only signature of the subtitles sent to forced alignment.
+ *
+ * It mirrors `buildAlignSnapshot`: untimed line-break/blank tokens are ignored,
+ * ids are excluded, while token and segment boundaries are kept because the
+ * aligner maps timings per token. A different signature means the stored
+ * timings were computed for other text and alignment must run again.
+ */
+function subtitleSignature(segments: Segment[]): string {
+  return segments
+    .map((segment) =>
+      segment.tokens
+        .filter((token) => token.text.trim() !== '')
+        .map((token) => token.text)
+        .join('\u001f'),
+    )
+    .filter((text) => text !== '')
+    .join('\u001e')
+}
+
 const TOKEN_STYLE_SELECT_ID = 'token-style-select'
 
 /** Popup-friendly duration text for a token with unknown bounds. */
@@ -149,6 +179,30 @@ function withoutStyleName(token: Token): Token {
 }
 
 const UPLOAD_ERROR_MESSAGE = '上传失败，请检查网络后重试'
+
+/** Export runs on the server through Remotion's renderer. */
+const EXPORT_FAILED_MESSAGE = '导出失败，请稍后重试'
+/** How often the client asks the server for export progress. */
+const EXPORT_POLL_INTERVAL_MS = 800
+
+/** Snapshot of the current export job, mirrored into rendering UI state. */
+type ExportState = {
+  status: ExportJob['status']
+  progress: number
+  message: string
+  filename: string
+  error: string | null
+}
+
+function exportStateFromJob(job: ExportJob): ExportState {
+  return {
+    status: job.status,
+    progress: job.progress,
+    message: job.message,
+    filename: job.filename,
+    error: job.error,
+  }
+}
 
 const ASR_POLL_INTERVAL_MS = 1000
 const ASR_START_ERROR = '语音识别启动失败，请稍后重试'
@@ -274,7 +328,11 @@ function buildAlignSnapshot(
 }
 
 /** Await one poll interval; resolves `true` when aborted, detaching its listener. */
-function waitForNextPoll(controller: AbortController): Promise<boolean> {  return new Promise<boolean>((resolve) => {
+function waitForNextPoll(
+  controller: AbortController,
+  intervalMs = ASR_POLL_INTERVAL_MS,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
     if (controller.signal.aborted) {
       resolve(true)
       return
@@ -286,7 +344,7 @@ function waitForNextPoll(controller: AbortController): Promise<boolean> {  retur
     const timer = window.setTimeout(() => {
       controller.signal.removeEventListener('abort', onAbort)
       resolve(false)
-    }, ASR_POLL_INTERVAL_MS)
+    }, intervalMs)
     controller.signal.addEventListener('abort', onAbort, { once: true })
   })
 }
@@ -323,10 +381,18 @@ function App() {
   } | null>(null)
   const [asr, setAsr] = useState<AsrState | null>(null)
   const [asrResult, setAsrResult] = useState<AsrJobResult | null>(null)
+  /**
+   * Subtitle signature whose timings are current (workspace restore, ASR or a
+   * completed forced alignment). Any later text edit makes it stale.
+   */
+  const [alignedSignature, setAlignedSignature] = useState(() =>
+    subtitleSignature(segments),
+  )
   const [workspaceNotice, setWorkspaceNotice] = useState<{
     kind: 'status' | 'error'
     text: string
   } | null>(null)
+  const [exportState, setExportState] = useState<ExportState | null>(null)
   const [isWorkspaceLoading, setIsWorkspaceLoading] = useState(true)
   // Token classes come from the named style registry, never inline values.
   const { getStyle: getTokenStyle, styles: registeredStyles } = useSubtitleTokenStyle()
@@ -338,6 +404,8 @@ function App() {
 
   const rowRefs = useRef(new Map<string, HTMLLIElement>())
   const tokenRefs = useRef(new Map<string, HTMLSpanElement>())
+  /** Imperative handle to the preview player, used to seek from segment rows. */
+  const playerRef = useRef<VideoPreviewHandle | null>(null)
   const popupRef = useRef<HTMLDivElement | null>(null)
   const tokenPopupRef = useRef<HTMLDivElement | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
@@ -356,6 +424,12 @@ function App() {
   const videoRef = useRef<VideoMetadata | null>(null)
   const deleteTimersRef = useRef(new Set<number>())
   const asrPollRef = useRef<AbortController | null>(null)
+  /** In-flight browser export; aborting it cancels the Remotion render. */
+  const exportAbortRef = useRef<AbortController | null>(null)
+  /** Server-side export job currently being polled. */
+  const exportJobRef = useRef<string | null>(null)
+  /** True while the create-export request is in flight (double-click guard). */
+  const exportStartingRef = useRef(false)
   // The job the UI is currently showing; only results for this exact pair are
   // accepted, so a stale poll from a previous video can never overwrite state.
   const asrActiveRef = useRef<{ jobId: string; videoId: string } | null>(null)
@@ -367,6 +441,8 @@ function App() {
 
   const isAsrActive =
     asr !== null && (asr.status === 'queued' || asr.status === 'running' || asr.status === 'starting')
+  const isExporting =
+    exportState?.status === 'preparing' || exportState?.status === 'rendering'
 
   const alignMeaningfulChars = segments.reduce(
     (total, segment) =>
@@ -379,6 +455,17 @@ function App() {
   )
   /** Alignment needs a video plus some subtitle text (no length cap). */
   const hasAlignText = alignMeaningfulChars > 0
+
+  const currentSubtitleSignature = useMemo(
+    () => subtitleSignature(segments),
+    [segments],
+  )
+  /** Text changed since the last ASR/alignment, so the timings may be stale. */
+  const needsReAlign =
+    video !== null &&
+    hasAlignText &&
+    !isAsrActive &&
+    currentSubtitleSignature !== alignedSignature
 
   const editingSegment =
     segments.find((segment) => segment.id === editingId) ?? null
@@ -595,6 +682,7 @@ function App() {
           return
         }
         setSegments(result.segments)
+        setAlignedSignature(subtitleSignature(result.segments))
         setAsrResult(result)
         setSelectedId(null)
         setInspectedToken(null)
@@ -643,6 +731,7 @@ function App() {
     const current = videoRef.current
     if (!current) return
     if (asrStartingRef.current || isAsrActive) return
+    if (exportAbortRef.current !== null) return
 
     const noun = kind === 'align' ? '强制对齐' : '语音识别'
     const startError = kind === 'align' ? ALIGN_START_ERROR : ASR_START_ERROR
@@ -804,6 +893,114 @@ function App() {
     }
   }, [])
 
+  /**
+   * Export the current subtitles burned into the video.
+   *
+   * The server renders the same Remotion composition the player shows (one
+   * export at a time) and this function polls its progress. Rendering a snapshot:
+   * later edits do not affect an export that has already started.
+   */
+  const startExport = async () => {
+    const current = videoRef.current
+    if (!current || isAsrActive || isExporting) return
+    if (exportStartingRef.current || exportJobRef.current !== null) return
+
+    exportStartingRef.current = true
+    const controller = new AbortController()
+    exportAbortRef.current = controller
+    setExportState({
+      status: 'preparing',
+      progress: 0,
+      message: '正在准备导出…',
+      filename: '',
+      error: null,
+    })
+
+    try {
+      const job = await createExportJob({
+        segments: segmentsRef.current,
+        styles: registeredStyles,
+      })
+      if (controller.signal.aborted) {
+        void cancelExportJob(job.id)
+        return
+      }
+      exportJobRef.current = job.id
+      setExportState(exportStateFromJob(job))
+      await pollExportJob(job, controller)
+    } catch (error) {
+      if (controller.signal.aborted) return
+      setExportState({
+        status: 'failed',
+        progress: 0,
+        message:
+          error instanceof ExportRequestError && error.message !== ''
+            ? error.message
+            : EXPORT_FAILED_MESSAGE,
+        filename: '',
+        error: null,
+      })
+    } finally {
+      exportStartingRef.current = false
+      if (exportAbortRef.current === controller) exportAbortRef.current = null
+      exportJobRef.current = null
+    }
+  }
+
+  /** Poll one job until it finishes, mirroring its progress into the UI. */
+  const pollExportJob = async (job: ExportJob, controller: AbortController) => {
+    let latest = job
+    while (!controller.signal.aborted) {
+      if (latest.status === 'completed') {
+        setExportState(exportStateFromJob(latest))
+        downloadExportFile(latest)
+        return
+      }
+      if (latest.status === 'failed' || latest.status === 'cancelled') {
+        setExportState(exportStateFromJob(latest))
+        return
+      }
+      const aborted = await waitForNextPoll(controller, EXPORT_POLL_INTERVAL_MS)
+      if (aborted) return
+      try {
+        latest = await fetchExportJob(job.id, controller.signal)
+      } catch (error) {
+        if (controller.signal.aborted) return
+        if (error instanceof ExportRequestError) {
+          setExportState({
+            status: 'failed',
+            progress: 0,
+            message: error.message,
+            filename: job.filename,
+            error: null,
+          })
+          return
+        }
+        // A transient network hiccup should not lose the running render.
+        continue
+      }
+      if (controller.signal.aborted) return
+      setExportState(exportStateFromJob(latest))
+    }
+  }
+
+  const cancelExport = () => {
+    const jobId = exportJobRef.current
+    exportAbortRef.current?.abort()
+    exportAbortRef.current = null
+    exportJobRef.current = null
+    if (jobId !== null) void cancelExportJob(jobId)
+    setExportState(null)
+  }
+
+  useEffect(() => {
+    return () => {
+      exportAbortRef.current?.abort()
+      const jobId = exportJobRef.current
+      if (jobId !== null) void cancelExportJob(jobId)
+    }
+  }, [])
+
   useEffect(() => {
     return () => {
       clearTimers()
@@ -843,6 +1040,7 @@ function App() {
           const restored = Array.isArray(document.segments) ? document.segments : []
           segmentsRef.current = restored
           setSegments(restored)
+          setAlignedSignature(subtitleSignature(restored))
         }
       } catch {
         if (!cancelled) setWorkspaceNotice({ kind: 'error', text: WORKSPACE_LOAD_ERROR })
@@ -1009,6 +1207,7 @@ function App() {
       adoptWorkspaceVideo(metadata)
       segmentsRef.current = []
       setSegments([])
+      setAlignedSignature(subtitleSignature([]))
       setSelectedId(null)
       setEditingId(null)
       setDraft('')
@@ -1056,9 +1255,27 @@ function App() {
     setCaret(null)
   }
 
-  /** Open the token popup (timing info + style picker), closing the editor. */
+  /** Move the preview player to a time in seconds; unknown times are ignored. */
+  const seekPreview = (
+    seconds: number | null,
+    options?: { pause?: boolean },
+  ) => {
+    if (seconds === null) return
+    playerRef.current?.seekToSeconds(seconds, options)
+  }
+
+  /**
+   * Open the token popup (timing info + style picker), closing the editor, and
+   * pause the preview at the token's start (falling back to the segment start)
+   * so the frame can be inspected without playback moving on.
+   */
   const inspectToken = (segmentId: string, tokenId: string) => {
     if (isAsrActive) return
+    const segment = segments.find((item) => item.id === segmentId)
+    const token = segment?.tokens.find((item) => item.id === tokenId)
+    seekPreview(token?.start ?? (segment ? segmentStart(segment) : null), {
+      pause: true,
+    })
     if (editingId !== null) closeEditor()
     setSelectedId(segmentId)
     setInspectedToken({ segmentId, tokenId })
@@ -1066,6 +1283,12 @@ function App() {
 
   const closeTokenPopup = () => {
     setInspectedToken(null)
+  }
+
+  /** Clicking a row selects it and jumps the preview to its first trusted time. */
+  const focusSegment = (segment: Segment) => {
+    setSelectedId(segment.id)
+    seekPreview(segmentStart(segment))
   }
 
   /**
@@ -1465,15 +1688,20 @@ function App() {
   // interaction starts from a clean popup.
   const inspectedKey = inspected ? `${inspected.segment.id}/${inspected.token.id}` : null
 
-  // Style picker options come straight from the registry; `default` is always
-  // present because the provider registers it up front.
+  // Style picker options come straight from the registry; the built-in styles
+  // (`default`, `emphasis`) are always present because the provider registers
+  // them up front.
   const styleOptions = useMemo(() => {
     const names = Object.keys(registeredStyles)
-    // Keep `default` first for a stable, predictable list.
+    // Built-in styles first in a fixed order, then custom names alphabetically.
+    const builtInOrder = Object.keys(BUILT_IN_SUBTITLE_TOKEN_STYLES)
+    const rank = (name: string) => {
+      const index = builtInOrder.indexOf(name)
+      return index === -1 ? builtInOrder.length : index
+    }
     names.sort((a, b) => {
-      if (a === DEFAULT_SUBTITLE_TOKEN_STYLE_NAME) return -1
-      if (b === DEFAULT_SUBTITLE_TOKEN_STYLE_NAME) return 1
-      return a.localeCompare(b)
+      const byRank = rank(a) - rank(b)
+      return byRank !== 0 ? byRank : a.localeCompare(b)
     })
     return names
   }, [registeredStyles])
@@ -1594,15 +1822,12 @@ function App() {
           </span>
         </div>
         <div className="toolbar" role="group" aria-label="工作流程">
-          <button
-            type="button"
-            className="primary-btn"
-            onClick={openPicker}
-            disabled={isAsrActive || isUploading}
-            title={
+          <button type="button" className="primary-btn" onClick={openPicker} disabled={isAsrActive || isExporting || isUploading} title={
               isAsrActive
                 ? '语音识别进行中，暂时无法更换视频'
-                : '选择本地视频文件'
+                : isExporting
+                  ? '导出进行中，暂时无法更换视频'
+                  : '选择本地视频文件'
             }
           >
             选择视频
@@ -1621,11 +1846,13 @@ function App() {
               type="button"
               className="ghost-btn"
               onClick={() => void startAsr('asr')}
-              disabled={!video || isUploading || isAsrActive}
+              disabled={!video || isUploading || isAsrActive || isExporting}
               title={
-                video
-                  ? '使用本地 Qwen3-ASR 识别视频语音'
-                  : '请先选择视频'
+                !video
+                  ? '请先选择视频'
+                  : isExporting
+                    ? '导出进行中，暂时无法识别'
+                    : '使用本地 Qwen3-ASR 识别视频语音'
               }
             >
               语音识别
@@ -1635,12 +1862,14 @@ function App() {
             type="button"
             className="ghost-btn"
             onClick={openSubtitlePicker}
-            disabled={isImportingSubtitle || isAsrActive}
+            disabled={isImportingSubtitle || isAsrActive || isExporting}
             aria-busy={isImportingSubtitle}
             title={
-              isAsrActive
-                ? '语音识别进行中，暂时无法导入字幕'
-                : '导入本地 TXT 字幕文件'
+              isExporting
+                ? '导出进行中，暂时无法导入字幕'
+                : isAsrActive
+                  ? '语音识别进行中，暂时无法导入字幕'
+                  : '导入本地 TXT 字幕文件'
             }
           >
             上传字幕
@@ -1649,21 +1878,45 @@ function App() {
             type="button"
             className="ghost-btn"
             onClick={() => void startAsr('align')}
-            disabled={!video || isUploading || isAsrActive || !hasAlignText}
+            disabled={!video || isUploading || isAsrActive || isExporting || !hasAlignText}
             title={
               !video
                 ? '请先选择视频'
                 : !hasAlignText
                   ? '请先导入或识别字幕'
-                  : '用已有字幕文本强制对齐视频语音'
+                  : isExporting
+                    ? '导出进行中，暂时无法对齐'
+                    : '用已有字幕文本强制对齐视频语音'
             }
           >
             强制对齐
           </button>
-          <button type="button" className="ghost-btn" disabled title="尚未实现">
-            导出
-            <span className="sr-only">（尚未实现）</span>
-          </button>
+          {isExporting ? (
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={cancelExport}
+              title="取消当前的视频导出"
+            >
+              取消导出
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="primary-btn"
+              onClick={() => void startExport()}
+              disabled={!video || isUploading || isAsrActive}
+              title={
+                !video
+                  ? '请先选择视频'
+                  : isAsrActive
+                    ? '语音识别进行中，暂时无法导出'
+                    : '用 Remotion 在本地导出带字幕的 MP4'
+              }
+            >
+              导出
+            </button>
+          )}
         </div>
         <input
           ref={fileInputRef}
@@ -1768,6 +2021,12 @@ function App() {
             </p>
           ) : null}
 
+          {needsReAlign ? (
+            <p className="stage-warning" role="status" data-align-needed="true">
+              字幕有变化，需要重新强制对齐
+            </p>
+          ) : null}
+
           <ul
             className="segment-list"
             aria-label="字幕分段列表"
@@ -1793,6 +2052,12 @@ function App() {
                   }}
                   className={rowClassName}
                   aria-label={`第 ${index + 1} 段字幕`}
+                  title={
+                    segmentStart(segment) === null
+                      ? undefined
+                      : '点击定位到该段开始时间'
+                  }
+                  onClick={() => focusSegment(segment)}
                 >
                   <div className="segment-head">
                     <span className="segment-index" aria-hidden="true">
@@ -1805,7 +2070,10 @@ function App() {
                       <button
                         type="button"
                         className="segment-edit-btn ghost-btn"
-                        onClick={() => openEditor(segment)}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          openEditor(segment)
+                        }}
                         disabled={isAsrActive}
                         aria-label={`编辑第 ${index + 1} 段字幕`}
                       >
@@ -1814,7 +2082,10 @@ function App() {
                       <button
                         type="button"
                         className="segment-merge-btn ghost-btn"
-                        onClick={() => mergeFromRow(segment.id, 'previous')}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          mergeFromRow(segment.id, 'previous')
+                        }}
                         disabled={isAsrActive || index === 0}
                         title={
                           index === 0
@@ -1828,7 +2099,10 @@ function App() {
                       <button
                         type="button"
                         className="segment-merge-btn ghost-btn"
-                        onClick={() => mergeFromRow(segment.id, 'next')}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          mergeFromRow(segment.id, 'next')
+                        }}
                         disabled={isAsrActive || index >= segments.length - 1}
                         title={
                           index >= segments.length - 1
@@ -1942,9 +2216,46 @@ function App() {
             </p>
           ) : null}
 
+          {exportState ? (
+            <div
+              className={`${
+                exportState.status === 'failed'
+                  ? 'stage-error'
+                  : exportState.status === 'completed'
+                    ? 'stage-status export-status export-status--done'
+                    : 'stage-status export-status'
+              }`}
+              role={exportState.status === 'failed' ? 'alert' : 'status'}
+              data-export-status={exportState.status}
+            >
+              <span>
+                {exportState.status === 'completed'
+                  ? `已导出 ${exportState.filename}`
+                  : exportState.message}
+              </span>
+              {isExporting ? (
+                <>
+                  <progress
+                    className="export-progress"
+                    max={100}
+                    value={Math.round(exportState.progress * 100)}
+                    aria-label="导出进度"
+                  />
+                  <button
+                    type="button"
+                    className="inline-cancel-btn"
+                    onClick={cancelExport}
+                  >
+                    取消
+                  </button>
+                </>
+              ) : null}
+            </div>
+          ) : null}
+
           {video ? (
             <>
-              <VideoPreview key={video.id} video={video} />
+              <VideoPreview key={video.id} ref={playerRef} video={video} />
               <dl className="video-facts">
                 <div className="video-fact">
                   <dt>文件名</dt>
@@ -2087,7 +2398,7 @@ function App() {
             >
               {styleOptions.map((name) => (
                 <option key={name} value={name}>
-                  {name === DEFAULT_SUBTITLE_TOKEN_STYLE_NAME ? '默认样式' : name}
+                  {subtitleTokenStyleLabel(name)}
                 </option>
               ))}
             </select>
