@@ -87,24 +87,27 @@ text (see below).
 
 Failures exit non-zero with one JSON object on stderr:
 `{"code": "...", "message": "..."}` (e.g. `ALIGN_EMPTY_TEXT`,
-`ALIGN_EMPTY_RESULT`, or `WORKER_FAILED` with the underlying exception class).
+`ALIGN_EMPTY_RESULT`, `ALIGN_AUDIO_TOO_LONG`, or `WORKER_FAILED` with the
+underlying exception class).
 
 ## Alignment limits
 
-There is **no duration cap and no character cap**. The worker loads the whole
-audio and hands it plus the supplied text to `QwenForcedAligner.align(...)` in
-a single call. The only validation is that the text is non-empty.
+`QwenForcedAligner` needs the whole audio plus all text in **one** llama.cpp
+decode batch. It hard-codes `n_batch = 2048` and only forwards `n_ctx`, so long
+input used to abort inside llama.cpp
+(`GGML_ASSERT(n_tokens_all <= cparams.n_batch)` → Windows exit code
+`3221226505`).
 
-Honest caveat: the aligner still runs with its fixed decoder context
-(`n_ctx = 2048` in `qwen_asr_gguf`), and the encoder/LLM also need memory for
-the audio and the text tokens. With long audio or very long text these real
-limits can still produce a low-level failure from the runtime (context
-overflow, allocation failure, very slow inference). Such errors are reported as
-they occur (`WORKER_FAILED` plus the underlying exception name, with the
-traceback in the job log tail) — they are not predicted, pre-empted, silently
-truncated, or split into chunks.
-Long-input / long-text support has **not** been measured; see the user
-verification steps in the removal report.
+`python/qwen_worker.py` now sizes both values from the actual input
+(`estimate_align_context`): about 14 audio tokens per second plus a
+conservative text budget, rounded up to 512 and capped at **16384** positions.
+Measured on the bundled 0.6B aligner: 86 s audio + 434 characters needs 2320
+positions, and the estimate reserves 3584 for it.
+
+- Within the budget the alignment runs normally.
+- Above it the worker fails before loading the decoder and reports
+  `ALIGN_AUDIO_TOO_LONG` with the estimated size, so the API returns a clear
+  message instead of a native crash. Split or trim the video for longer input.
 
 The HTTP layer still applies its own independent, structural limits (not text
 length): at most 400 segments, 4000 tokens, and a 512 kb request body.

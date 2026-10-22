@@ -15,6 +15,7 @@ the Node side can localize the error.
 
 import argparse
 import json
+import math
 import os
 import sys
 import traceback
@@ -22,6 +23,15 @@ from pathlib import Path
 
 DEFAULT_LANGUAGE = "Chinese"
 CPU_ONLY_ENV = {"VK_ICD_FILENAMES": "none", "GGML_VULKAN": "0"}
+
+# The aligner builds one sequence (audio embeddings + every word + two
+# <timestamp> tokens per word) and decodes it in a single batch. Measured on the
+# bundled 0.6B aligner: ~13 audio tokens per second of audio and ~1 token per
+# text character, so this budget is deliberately conservative.
+ALIGN_AUDIO_TOKENS_PER_SECOND = 14.0
+ALIGN_CONTEXT_STEP = 512
+ALIGN_MIN_CONTEXT = 2048
+ALIGN_MAX_CONTEXT = 16384
 
 
 class WorkerError(Exception):
@@ -153,8 +163,55 @@ def run_asr(input_path: Path, runtime_dir: Path, request: dict) -> dict:
     }
 
 
+def estimate_align_context(duration: float, text: str) -> int:
+    """Context size that fits one whole-audio alignment pass.
+
+    `QwenForcedAligner` hard-codes ``n_batch=2048`` and only forwards
+    ``AlignerConfig.n_ctx``; a longer sequence aborts inside llama.cpp with
+    ``GGML_ASSERT(n_tokens_all <= cparams.n_batch)``. Counting every character
+    as a word keeps the estimate above the real token count.
+    """
+    needed = 4 + int(duration * ALIGN_AUDIO_TOKENS_PER_SECOND) + 3 * len(text)
+    target = int(needed * 1.15)
+    return max(ALIGN_MIN_CONTEXT, math.ceil(target / ALIGN_CONTEXT_STEP) * ALIGN_CONTEXT_STEP)
+
+
+def create_forced_aligner(model_dir: str, context_size: int):
+    """Build a `QwenForcedAligner` with room for the whole audio + text.
+
+    The shared ``llama`` module is patched only while the context is created, so
+    the upstream package stays unmodified on disk and both ``n_ctx`` and
+    ``n_batch`` cover the single decode call.
+    """
+    from qwen_asr_gguf.inference import AlignerConfig, QwenForcedAligner
+    from qwen_asr_gguf.inference import llama as llama_module
+
+    base_context = llama_module.LlamaContext
+
+    class SizedLlamaContext(base_context):
+        def __init__(self, model, n_ctx=2048, n_batch=2048, **kwargs):
+            super().__init__(
+                model,
+                n_ctx=max(int(n_ctx), context_size),
+                n_batch=max(int(n_batch), context_size),
+                **kwargs,
+            )
+
+    llama_module.LlamaContext = SizedLlamaContext
+    try:
+        return QwenForcedAligner(
+            config=AlignerConfig(
+                model_dir=model_dir,
+                use_dml=False,
+                n_ctx=context_size,
+            )
+        )
+    finally:
+        llama_module.LlamaContext = base_context
+
+
 def run_align(input_path: Path, runtime_dir: Path, request: dict) -> dict:
-    from qwen_asr_gguf.inference import AlignerConfig, QwenForcedAligner, load_audio
+    from qwen_asr_gguf.inference import load_audio
     from qwen_asr_gguf.inference.utils import normalize_language_name, validate_language
 
     text = request.get("text")
@@ -166,14 +223,20 @@ def run_align(input_path: Path, runtime_dir: Path, request: dict) -> dict:
 
     model_dir = str(runtime_dir / "model")
 
-    # No duration or character cap: the whole audio and the supplied text are
-    # handed to the aligner, and any low-level failure (context / resource
-    # exhaustion) is reported as-is instead of being pre-empted by an
-    # artificial limit.
+    # The aligner needs the whole audio and text in one sequence; size the
+    # context to that sequence instead of letting llama.cpp abort on its
+    # fixed 2048-token batch.
     audio = load_audio(str(input_path))
     duration = float(len(audio)) / 16000.0
+    context_size = estimate_align_context(duration, text)
+    if context_size > ALIGN_MAX_CONTEXT:
+        raise WorkerError(
+            "ALIGN_AUDIO_TOO_LONG",
+            f"音频与字幕过长，强制对齐需要约 {context_size} 个上下文位置，"
+            f"超过上限 {ALIGN_MAX_CONTEXT}。请先裁剪视频或分段对齐。",
+        )
 
-    aligner = QwenForcedAligner(config=AlignerConfig(model_dir=model_dir, use_dml=False))
+    aligner = create_forced_aligner(model_dir, context_size)
     result = aligner.align(audio, text, language=language)
     raw = items_to_raw(getattr(result, "items", None) if result is not None else None)
     if not raw:

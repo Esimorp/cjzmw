@@ -4,8 +4,10 @@ import test from 'node:test'
 import {
   appendBoundedLog,
   killProcessTree,
+  lastStderrHint,
   mapAlignSnapshot,
   parseWorkerResult,
+  readWorkerError,
   validateAlignSnapshot,
 } from '../asr-server.ts'
 
@@ -165,6 +167,35 @@ test('worker result parsing tolerates only well formed JSON', () => {
     () => parseWorkerResult('not json'),
     (error: Error & { code?: string }) => error.code === 'WORKER_NO_RESULT',
   )
+})
+
+test('structured worker failures are surfaced from the stderr tail', () => {
+  const job: { log: { stream: 'stdout' | 'stderr'; line: string }[] } = { log: [] }
+  appendBoundedLog(job, 'stdout', 'worker ok\n')
+  appendBoundedLog(job, 'stderr', '{"code":"ALIGN_AUDIO_TOO_LONG","message":"音频与字幕过长。"}\n')
+  assert.deepEqual(readWorkerError(job), {
+    code: 'ALIGN_AUDIO_TOO_LONG',
+    message: '音频与字幕过长。',
+  })
+})
+
+test('only the last well formed structured worker failure is used', () => {
+  const job: { log: { stream: 'stdout' | 'stderr'; line: string }[] } = { log: [] }
+  appendBoundedLog(job, 'stderr', '{"code":"FIRST","message":"旧错误"}\n')
+  appendBoundedLog(job, 'stderr', '{"code":\n')
+  appendBoundedLog(job, 'stderr', '{"code":"SECOND","message":"新错误"}\n')
+  assert.equal(readWorkerError(job)?.code, 'SECOND')
+})
+
+test('native crash reports keep the last stderr line and ignore empty logs', () => {
+  const job: { log: { stream: 'stdout' | 'stderr'; line: string }[] } = { log: [] }
+  appendBoundedLog(job, 'stderr', 'GGML_ASSERT(n_tokens_all <= cparams.n_batch) failed\n')
+  assert.equal(lastStderrHint(job), ' GGML_ASSERT(n_tokens_all <= cparams.n_batch) failed')
+  assert.equal(readWorkerError(job), null)
+
+  const empty: { log: { stream: 'stdout' | 'stderr'; line: string }[] } = { log: [] }
+  assert.equal(readWorkerError(empty), null)
+  assert.equal(lastStderrHint(empty), '')
 })
 
 test('token popup anchor effect does not depend on freshly built objects', () => {  // Regression for the white screen: the popup anchor layout effect listed a

@@ -340,6 +340,43 @@ export function appendBoundedLog(job: { log: JobLog[] }, stream: JobLog['stream'
 }
 
 /**
+ * Last structured worker failure, e.g. `{"code":"ALIGN_AUDIO_TOO_LONG",...}`.
+ * The worker writes exactly one such JSON line to stderr before exiting.
+ */
+export function readWorkerError(
+  job: { log: JobLog[] },
+): { code: string; message: string } | null {
+  for (let index = job.log.length - 1; index >= 0; index -= 1) {
+    const entry = job.log[index]
+    if (entry.stream !== 'stderr' || !entry.line.startsWith('{')) continue
+    try {
+      const parsed = JSON.parse(entry.line) as { code?: unknown; message?: unknown }
+      if (
+        typeof parsed.code === 'string' &&
+        typeof parsed.message === 'string' &&
+        parsed.message.trim() !== ''
+      ) {
+        return { code: parsed.code, message: parsed.message }
+      }
+    } catch {
+      // Not the structured error line; keep looking further up.
+    }
+  }
+  return null
+}
+
+/** Last stderr line, appended to a crash report so native aborts stay visible. */
+export function lastStderrHint(job: { log: JobLog[] }): string {
+  for (let index = job.log.length - 1; index >= 0; index -= 1) {
+    const entry = job.log[index]
+    if (entry.stream === 'stderr' && entry.line.trim() !== '') {
+      return ` ${entry.line.trim()}`
+    }
+  }
+  return ''
+}
+
+/**
  * Terminate a tracked process and its children.
  *
  * On Windows the transcription runtime spawns helper worker processes, so the
@@ -728,7 +765,17 @@ export async function createAsrService(deps: AsrServiceDependencies): Promise<As
           message: `${label}任务已取消或超时。`,
         }
       } else if (error instanceof AsrError) {
-        job.error = { code: error.code, message: error.message }
+        if (error.code === 'ASR_RUNTIME_FAILED') {
+          // A non-zero worker exit: prefer its structured error, otherwise show
+          // the exit code together with the native failure line (e.g. a
+          // llama.cpp GGML_ASSERT) so the crash is diagnosable.
+          job.error = readWorkerError(job) ?? {
+            code: error.code,
+            message: `${error.message}${lastStderrHint(job)}`,
+          }
+        } else {
+          job.error = { code: error.code, message: error.message }
+        }
       } else {
         console.error(`${label} job failed:`, error)
         job.error = {
